@@ -85,12 +85,23 @@ $wim = Get-ChildItem "$LocalMedia\sources" -Include 'install.wim','install.esd' 
        Select-Object -First 1
 if (-not $wim) { Fail 15 'No install.wim/install.esd found in media.' }
 
+# Match on WIM metadata, not the display name - image names vary by media
+# (eval/localized/VLSC builds don't all say "Desktop Experience").
+# Datacenter with GUI = EditionId ServerDatacenter* + InstallationType 'Server'
+# (Core editions report InstallationType 'Server Core').
 $images = Get-WindowsImage -ImagePath $wim.FullName
-$target = $images | Where-Object {
-    $_.ImageName -match 'Datacenter' -and $_.ImageName -match 'Desktop'
-} | Select-Object -First 1
-if (-not $target) { Fail 15 "No 'Datacenter (Desktop Experience)' image found. Images: $($images.ImageName -join '; ')" }
-Write-Output "Using image index $($target.ImageIndex): $($target.ImageName)"
+$target = $null
+$seen = @()
+foreach ($img in $images) {
+    $detail = Get-WindowsImage -ImagePath $wim.FullName -Index $img.ImageIndex
+    $seen += "[$($img.ImageIndex)] $($detail.ImageName) | $($detail.EditionId) | $($detail.InstallationType)"
+    if ($detail.EditionId -like 'ServerDatacenter*' -and $detail.InstallationType -eq 'Server') {
+        $target = $detail
+        break
+    }
+}
+if (-not $target) { Fail 15 "No Datacenter (GUI) image found. Media contains: $($seen -join ' ;; ')" }
+Write-Output "Using image index $($target.ImageIndex): $($target.ImageName) [$($target.EditionId) / $($target.InstallationType)]"
 
 # --- Launch setup.exe detached via one-shot scheduled task ---
 # If PDQ ran setup directly, the deployment would hang until the first
