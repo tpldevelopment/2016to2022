@@ -8,6 +8,25 @@ Write-Output "OS:    $($os.Caption)"
 Write-Output "Build: $($os.BuildNumber)"
 Write-Output "Boot:  $($os.LastBootUpTime)"
 
+# Compare auto-start services against the pre-upgrade baseline, if one exists
+$baseline = 'C:\Temp\PreUpgrade-Services.json'
+if (Test-Path $baseline) {
+    $before = (Get-Content $baseline -Raw | ConvertFrom-Json) | Where-Object { $_.Status -eq 'Running' }
+    $missing = foreach ($svc in $before) {
+        $now = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+        if (-not $now) { "$($svc.Name) ($($svc.DisplayName)) - GONE after upgrade" }
+        elseif ($now.Status -ne 'Running') { "$($svc.Name) ($($svc.DisplayName)) - was running, now $($now.Status)" }
+    }
+    if ($missing) {
+        Write-Output 'SERVICE DIFF vs pre-upgrade baseline:'
+        $missing | ForEach-Object { Write-Output "  -> $_" }
+    } else {
+        Write-Output 'Service diff: all previously-running auto services are running.'
+    }
+} else {
+    Write-Output 'No pre-upgrade service baseline found (Preflight-Check.ps1 not run) - skipping service diff.'
+}
+
 # Server 2022 = build 20348
 if ([int]$os.BuildNumber -ge 20348) {
     Write-Output 'RESULT: Upgrade confirmed - Server 2022.'
