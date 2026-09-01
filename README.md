@@ -14,7 +14,6 @@ Three scripts, three PDQ packages, deployed in order.
 
 | Package | Script | Notes |
 |---|---|---|
-| 0. Preflight Check | `Preflight-Check.ps1` | Report-only readiness check: disk / edition / auto-services (saves baseline for the post-upgrade diff). Run against the whole candidate list first. **Then take a snapshot - manual.** |
 | 1. Server 2022 Upgrade | `Upgrade-2016-to-2022.ps1` | PowerShell step. Bump step timeout to **30 min** (media copy). Run as Deploy User. |
 | 2. Verify 2022 Upgrade | `Verify-Upgrade.ps1` | Deploy ~2h later. Success = on 2022. Also cleans up media. |
 | 3. Post-Upgrade MS Updates | `Install-MSUpdates.ps1` | PowerShell step + a **Reboot step** after it. Bump timeout to 60 min. |
