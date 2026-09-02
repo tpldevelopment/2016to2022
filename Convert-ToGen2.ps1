@@ -17,9 +17,12 @@
       4. Gen2 VM <name>-temp built on the converted copies; Secure Boot on
       5. Start (optional), VMM refresh + presence check, email report
 
-    Rollback at ANY point: the original Gen1 VM still exists with untouched
-    MBR disks. NEVER start it while <name>-temp is running (same hostname/
-    IP/MAC) - the failure handler reports both VMs' states for this reason.
+    Rollback semantics DIFFER BY MODE:
+      default (copy/PE): original VM + MBR disks untouched - start it to roll
+        back (never while <name>-temp runs: same hostname/IP/MAC).
+      -InPlace: the ORIGINAL disk is converted (irreversible). Rollback =
+        restore the backup, or rebuild a Gen1 shell from the MBR fallback
+        copies in <name>-temp. The old shell ends up diskless, NOT bootable.
 
 .USAGE
     .\Convert-ToGen2.ps1 -VMName VM01
@@ -61,6 +64,9 @@ $ErrorActionPreference = 'Stop'
 $NewName     = "$VMName-temp"
 $StagingName = "$VMName-staging"
 $phase       = 'preflight'
+$conversionAttempted = $false
+$disksDetached       = $false
+$newVmCreated        = $false
 
 $log = New-Object System.Collections.Generic.List[string]
 function Log($msg) {
@@ -142,6 +148,9 @@ try {
             [pscustomobject]@{
                 Path       = $d.Path
                 Controller = "$($d.ControllerType) $($d.ControllerNumber):$($d.ControllerLocation)"
+                CtrlType   = "$($d.ControllerType)"
+                CtrlNum    = $d.ControllerNumber
+                CtrlLoc    = $d.ControllerLocation
                 IsBoot     = ($d.ControllerType -eq 'IDE' -and $d.ControllerNumber -eq 0 -and $d.ControllerLocation -eq 0)
                 Format     = "$($vhd.VhdFormat)"
                 VhdType    = "$($vhd.VhdType)"
@@ -164,9 +173,9 @@ try {
             if ($c -ne 1) { throw "Port classification '$($n.PortClass)' resolves to $c objects in VMM - need exactly 1." }
         }
     }
-    if ($diskInfo.Count -gt 64) { throw "VM has $($diskInfo.Count) disks - more than one SCSI controller's 64-device limit. Handle manually." }
 
     $diskInfo = @($hp.Disks)
+    if ($diskInfo.Count -gt 64) { throw "VM has $($diskInfo.Count) disks - more than one SCSI controller's 64-device limit. Handle manually." }
     $diskInfo | ForEach-Object { Log "Disk: $($_.Controller) $($_.Path) [$($_.Format)/$($_.VhdType), $($_.FileSizeGB)GB$(if ($_.IsBoot) { ', BOOT' })]" }
     $boot = @($diskInfo | Where-Object IsBoot)
     if ($boot.Count -ne 1) { throw "Expected exactly one boot disk at IDE 0:0, found $($boot.Count). Nonstandard layout - handle manually." }
@@ -361,50 +370,103 @@ try {
         } -ArgumentList $VMName, $guestCred
         if ($ready -ne 'ready') { throw "Guest did not become reachable after restart ($ready). VM is running and unconverted - shut it down or retry." }
         Log "Guest back up + PowerShell Direct ready - converting (MBR fallback copy kept in $newDir)..."
+        $conversionAttempted = $true
         $ipResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
             param($name, $cred)
             $ErrorActionPreference = 'Stop'
             Invoke-Command -VMName $name -Credential $cred -ScriptBlock {
                 $ErrorActionPreference = 'Stop'
                 $r = New-Object System.Collections.Generic.List[string]
-                if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+                $suspended = @()
+                $blCmdlet = [bool](Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)
+                $bde = "$env:windir\System32\manage-bde.exe"
+                if ($blCmdlet) {
                     foreach ($v in Get-BitLockerVolume) {
                         if ($v.ProtectionStatus -notin 'On', 'Off') { throw "BitLocker state on $($v.MountPoint) is '$($v.ProtectionStatus)' (unknown) - refusing." }
                         if ($v.ProtectionStatus -eq 'On') {
-                            Suspend-BitLocker -MountPoint $v.MountPoint | Out-Null
+                            Suspend-BitLocker -MountPoint $v.MountPoint -RebootCount 0 | Out-Null
                             if ((Get-BitLockerVolume -MountPoint $v.MountPoint).ProtectionStatus -eq 'On') { throw "BitLocker suspension FAILED on $($v.MountPoint)." }
-                            $r.Add("BitLocker suspended on $($v.MountPoint).")
+                            $suspended += $v.MountPoint
+                            $r.Add("BitLocker suspended on $($v.MountPoint) (RebootCount 0 - stays off until protectors are recreated post-Gen2).")
                         }
                     }
+                } elseif (Test-Path $bde) {
+                    $raw = cmd.exe /c "`"$bde`" -status 2>&1" | Out-String
+                    if ($LASTEXITCODE -ne 0) { throw 'Cannot determine BitLocker state (manage-bde failed) - refusing to convert blind.' }
+                    if ($raw -match 'Protection Status:\s*Protection On') {
+                        cmd.exe /c "`"$bde`" -protectors -disable C: 2>&1" | Out-Null
+                        if ($LASTEXITCODE -ne 0) { throw 'BitLocker ON and manage-bde could not disable protectors - aborting.' }
+                        $suspended += 'C: (manage-bde)'
+                        $r.Add('BitLocker protectors disabled via manage-bde (stays off until re-enabled post-Gen2).')
+                    }
+                } elseif ((Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) -and -not (Get-WindowsFeature -Name BitLocker).Installed) {
+                    $r.Add('BitLocker feature not installed - cannot be active.')
+                } else {
+                    throw 'Cannot determine BitLocker state (no tooling) - refusing to convert blind.'
                 }
                 $v = cmd.exe /c "$env:windir\System32\mbr2gpt.exe /validate /allowFullOS 2>&1"
                 $r.Add("validate (exit $LASTEXITCODE): $(($v | Where-Object { $_ }) -join ' | ')")
-                if ($LASTEXITCODE -ne 0) { throw "mbr2gpt VALIDATE failed (exit $LASTEXITCODE) - disk NOT converted, VM unharmed. See %windir%\setupact.log in the guest." }
+                if ($LASTEXITCODE -ne 0) {
+                    # Undo BitLocker suspension before declaring the VM unharmed
+                    foreach ($m in $suspended) {
+                        if ($m -like '*manage-bde*') { cmd.exe /c "`"$bde`" -protectors -enable C: 2>&1" | Out-Null }
+                        else { Resume-BitLocker -MountPoint $m -ErrorAction SilentlyContinue | Out-Null }
+                    }
+                    if ($suspended.Count) { $r.Add("BitLocker protection resumed on: $($suspended -join ', ')") }
+                    throw "mbr2gpt VALIDATE failed (exit $LASTEXITCODE) - disk NOT converted; BitLocker restored. See %windir%\setupact.log in the guest."
+                }
                 $c = cmd.exe /c "$env:windir\System32\mbr2gpt.exe /convert /allowFullOS 2>&1"
                 $r.Add("convert (exit $LASTEXITCODE): $(($c | Where-Object { $_ }) -join ' | ')")
-                if ($LASTEXITCODE -eq 100) { throw 'mbr2gpt exit 100: disk IS GPT but BCD restore failed - converted-but-unbootable. RESTORE FROM BACKUP or swap in the MBR copy from the -temp folder.' }
-                if ($LASTEXITCODE -ne 0) { throw "mbr2gpt CONVERT failed (exit $LASTEXITCODE). Disk state uncertain - verify before booting; fallbacks: backup / -temp MBR copy." }
-                $r.Add('Conversion complete. Shutting down - this VM must NEVER boot as Gen1 again.')
+                if ($LASTEXITCODE -eq 100) { throw 'mbr2gpt exit 100: disk IS GPT but BCD restore failed - converted-but-unbootable. Guest is being shut down. RESTORE FROM BACKUP or rebuild from the -temp MBR copies.' }
+                if ($LASTEXITCODE -ne 0) { throw "mbr2gpt CONVERT failed (exit $LASTEXITCODE). Disk state uncertain - guest shutdown scheduled; verify before ANY boot. Fallbacks: backup / -temp MBR copies." }
+                # Schedule shutdown INSIDE the guest so a lost remoting result
+                # cannot leave a converted disk on a running Gen1 VM.
+                cmd.exe /c "shutdown /s /t 5 /c `"Gen2 conversion complete`"" | Out-Null
+                $r.Add('Conversion complete. In-guest shutdown scheduled (5s) - this VM must NEVER boot as Gen1 again.')
                 $r
             }
         } -ArgumentList $VMName, $guestCred
         $ipResult | ForEach-Object { Log $_ }
 
-        Stop-SCVirtualMachine -VM (Get-SCVirtualMachine -Name $VMName) -Shutdown -ErrorAction Stop | Out-Null
+        $conversionAttempted = $true
+        # The guest scheduled its own shutdown. Wait for PowerOff; if it does
+        # not arrive, FORCE the VM off - a converted disk must never stay
+        # attached to a running Gen1 VM.
         $vm = Get-SCVirtualMachine -Name $VMName
         for ($j = 0; $j -lt 60 -and $vm.VirtualMachineState -ne 'PowerOff'; $j++) { Start-Sleep -Seconds 10; $vm = Get-SCVirtualMachine -Name $VMName }
-        if ($vm.VirtualMachineState -ne 'PowerOff') { throw "'$VMName' did not shut down after conversion - DO NOT let it reboot as Gen1. Force it off, then rerun/inspect." }
-        Log "'$VMName' shut down post-conversion."
+        if ($vm.VirtualMachineState -ne 'PowerOff') {
+            $hvHost = $vm.VMHost.Name      # owner may have moved on a cluster
+            Log "'$VMName' did not shut down in 10 min - forcing power-off (disk is GPT; Gen1 must not run on it)."
+            Invoke-Command -ComputerName $hvHost -ScriptBlock {
+                param($n)
+                Stop-VM -Name $n -TurnOff -Force -ErrorAction Stop
+            } -ArgumentList $VMName
+            for ($j = 0; $j -lt 12; $j++) { Start-Sleep -Seconds 5; $vm = Get-SCVirtualMachine -Name $VMName; if ($vm.VirtualMachineState -eq 'PowerOff') { break } }
+            if ($vm.VirtualMachineState -ne 'PowerOff') { throw "'$VMName' STILL not off after force-TurnOff - stop it manually before anything else." }
+        }
+        Log "'$VMName' is off post-conversion."
 
-        # Detach the (now GPT) disks from the Gen1 shell so VMM can give them
-        # to the Gen2 VM. Files are NOT deleted. Rollback commands are logged.
-        Invoke-Command -ComputerName $hvHost -ScriptBlock {
-            param($name)
+        # Detach the (now GPT) disks from the Gen1 shell THROUGH VMM so its
+        # ownership data stays truthful. Files are NOT deleted. Verified on
+        # both the VMM and Hyper-V sides before proceeding.
+        $vm = Get-SCVirtualMachine -Name $VMName
+        $hvHost = $vm.VMHost.Name           # re-resolve owner before mutating
+        foreach ($dd in @($vm.VirtualDiskDrives)) {
+            Remove-SCVirtualDiskDrive -VirtualDiskDrive $dd -SkipDeleteVHD -ErrorAction Stop | Out-Null
+        }
+        Read-SCVirtualMachine -VM (Get-SCVirtualMachine -Name $VMName) -Force -ErrorAction SilentlyContinue | Out-Null
+        $vmmLeft  = @((Get-SCVirtualMachine -Name $VMName).VirtualDiskDrives).Count
+        $hostLeft = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+            param($n, $paths)
             $ErrorActionPreference = 'Stop'
-            Get-VMHardDiskDrive -VMName $name | Remove-VMHardDiskDrive
-        } -ArgumentList $VMName
-        Get-SCVMHost -ComputerName $hvHost | Read-SCVMHost | Out-Null
-        Log "Disks detached from the Gen1 shell (files untouched). Rollback if needed: restore backup, or re-attach with Add-VMHardDiskDrive -VMName '$VMName' -ControllerType IDE -ControllerNumber 0 -ControllerLocation 0 -Path '$($boot[0].Path)' (repeat per data disk) - but ONLY with an MBR disk (backup/-temp copy), the original is GPT now."
+            $left = @(Get-VMHardDiskDrive -VMName $n).Count
+            $missing = @($paths | Where-Object { -not (Test-Path $_) })
+            [pscustomobject]@{ Left = $left; Missing = $missing }
+        } -ArgumentList $VMName, @($diskInfo.Path)
+        if ($vmmLeft -ne 0 -or $hostLeft.Left -ne 0) { throw "Detach incomplete (VMM shows $vmmLeft, host shows $($hostLeft.Left) still attached) - resolve before the Gen2 build; do NOT start '$VMName'." }
+        if ($hostLeft.Missing.Count) { throw "Disk file(s) missing after detach: $($hostLeft.Missing -join ', ') - STOP and investigate." }
+        $disksDetached = $true
+        Log "Disks detached from the Gen1 shell (files untouched, VMM-consistent). MBR fallback copies remain in $newDir - never reattach the ORIGINALS to a Gen1 shell (they are GPT now)."
     }
     else {
         # =========================================================================
@@ -458,16 +520,20 @@ try {
                     }
                     Start-Sleep -Seconds 2
                     $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
+                    $okMarker = $false
                     foreach ($p in ($parts | Where-Object DriveLetter)) {
                         $lp = "$($p.DriveLetter):\gen2convert-pe.log"
-                        if (Test-Path $lp) { $peLog = Get-Content $lp -Raw; break }
+                        if (Test-Path $lp) { $peLog = Get-Content $lp -Raw }
+                        if (Test-Path "$($p.DriveLetter):\gen2convert-ok.marker") { $okMarker = $true }
+                        if ($peLog) { break }
                     }
                     if ($peLog) {
                         $out.Add('--- PE convert log ---')
                         ($peLog -split "`r?`n") | Where-Object { $_ } | ForEach-Object { $out.Add($_) }
                     }
                     if ($style -ne 'GPT') { $fail = "PE run finished but the copy is still $style (see PE log above). Original VM intact." }
-                    else { $ok = $true; $out.Add('Copy verified GPT - conversion succeeded.') }
+                    elseif (-not $okMarker) { $fail = 'Disk is GPT but PE left no success marker (possible exit-100 converted-but-unbootable, or log volume not found). Inspect the PE log before trusting this copy. Original VM intact.' }
+                    else { $ok = $true; $out.Add('Copy verified GPT + PE success marker present - conversion succeeded.') }
                 }
                 catch { $fail = "post-check: $_" }
                 finally { if ($mounted) { Dismount-VHD -Path $bootDisk -ErrorAction SilentlyContinue } }
@@ -542,6 +608,7 @@ try {
             -Path $parentDir -HardwareProfile $hwProfile -JobGroup $jobGroup `
             -UseLocalVirtualHardDisk -HighlyAvailable $vm.IsHighlyAvailable -ErrorAction Stop
         if (-not $newVm) { throw "New-SCVirtualMachine returned nothing - check the VMM job log." }
+        $newVmCreated = $true
     }
     finally {
         if ($hwProfile) { Remove-SCHardwareProfile -HardwareProfile $hwProfile -ErrorAction SilentlyContinue | Out-Null }
@@ -568,12 +635,26 @@ try {
     }
     Log "NOT carried over: VMM cloud/owner/custom properties, IP-pool assignments, checkpoint policy, CPU limits/weights, memory buffer/priority, automatic start/stop actions, NIC security/offload settings, original disk controller layout (all disks re-attach in order on SCSI 0). Carried: CPU/RAM/dynamic memory, VM networks or vSwitch, VLANs, static MACs, port classifications, HA flag."
     if ($blOn.Count) { Log "BitLocker was ON - Verify-Gen2 gates on protection resuming in the Gen2 VM; confirm recovery-key escrow." }
-    Log "Original '$VMName' left OFF as rollback. NEVER start it while '$NewName' runs (same hostname/IP/MAC)."
+    if ($InPlace) {
+        Log "Old shell '$VMName' is OFF and DISKLESS (its disks now belong to '$NewName'). It is NOT a bootable rollback - rollback = restore backup, or rebuild a Gen1 VM from the MBR copies in $newDir. Keep those copies until decommission."
+    } else {
+        Log "Original '$VMName' left OFF as rollback. NEVER start it while '$NewName' runs (same hostname/IP/MAC)."
+    }
     Log "SUCCESS. Next: .\Verify-Gen2.ps1 -VMName $VMName"
     Send-Report "Gen2 conversion OK: $VMName -> $NewName"
 }
 catch {
     Log "FAILED in phase '$phase': $_"
+    if ($InPlace -and $conversionAttempted) {
+        Log "IN-PLACE RECOVERY (conversion was attempted - the ORIGINAL boot disk may be GPT/partial):"
+        Log "  - Do NOT start '$VMName' with its original disks, and do NOT delete the -temp folder ($newDir holds your MBR fallback copies)."
+        Log "  - Recovery: restore the backup, OR rebuild the shell from the MBR copies:"
+        foreach ($p in $copyPlan) {
+            $d0 = $diskInfo | Where-Object Path -eq $p.Src
+            Log "      Add-VMHardDiskDrive -VMName '$VMName' -ControllerType $($d0.CtrlType) -ControllerNumber $($d0.CtrlNum) -ControllerLocation $($d0.CtrlLoc) -Path '$($p.Dst)'"
+        }
+        if ($disksDetached) { Log "  - Original GPT disk files are detached but intact in their original folder$(if ($newVmCreated) { "; '$NewName' exists and may own them - inspect the VMM job log" })." }
+    }
     # Report ACTUAL current states so the operator cannot double-run the server
     try {
         if ($hvHost) {
@@ -585,10 +666,16 @@ catch {
                 }
             } -ArgumentList (,@($VMName, $NewName, $StagingName))
             $states | ForEach-Object { Log "State: $_" }
-            Log "Rollback rule: start '$VMName' ONLY if '$NewName' and '$StagingName' are Off/not present (same hostname/IP/MAC - two running copies will conflict)."
+            if (-not ($InPlace -and $conversionAttempted)) {
+                Log "Rollback rule: start '$VMName' ONLY if '$NewName' and '$StagingName' are Off/not present (same hostname/IP/MAC - two running copies will conflict)."
+            }
         }
     } catch { Log "Could not query VM states: $_" }
-    Log "Original '$VMName' disks were never modified. Artifacts under the -temp folder can be inspected or deleted."
+    if ($InPlace -and $conversionAttempted) {
+        Log "Original disks WERE targeted by conversion - treat them as GPT/unknown. The -temp folder is your MBR fallback: keep it."
+    } else {
+        Log "Original '$VMName' disks were never modified. Artifacts under the -temp folder can be inspected or deleted."
+    }
     Send-Report "Gen2 conversion FAILED: $VMName (phase: $phase)"
     exit 1
 }

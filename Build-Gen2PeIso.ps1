@@ -27,12 +27,13 @@ if (Test-Path $work) { throw "$work already exists - delete it to rebuild." }
 
 Write-Host '1/5 Creating WinPE working copy...'
 cmd /c "`"$env2`" && copype amd64 $work" | Out-Null
-if (-not (Test-Path "$work\media\sources\boot.wim")) { throw 'copype failed - no boot.wim produced.' }
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$work\media\sources\boot.wim")) { throw "copype failed (exit $LASTEXITCODE)." }
 
 Write-Host '2/5 Mounting boot.wim...'
 $mount = "$work\mount"
 New-Item -Path $mount -ItemType Directory -Force | Out-Null
 dism /Mount-Image /ImageFile:"$work\media\sources\boot.wim" /Index:1 /MountDir:"$mount" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "dism mount failed (exit $LASTEXITCODE)." }
 
 try {
     Write-Host '3/5 Injecting mbr2gpt + autorun script...'
@@ -57,11 +58,13 @@ if errorlevel 1 (
     echo CONVERT FAILED errorlevel %errorlevel% >> X:\convert.log
 ) else (
     echo CONVERT OK >> X:\convert.log
+    echo OK > X:\convert.ok
 )
 :save
-for %%D in (C D E F G) do (
+for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (
     if exist %%D:\Windows (
         copy /y X:\convert.log %%D:\gen2convert-pe.log > nul
+        if exist X:\convert.ok copy /y X:\convert.ok %%D:\gen2convert-ok.marker > nul
         copy /y X:\Windows\setupact.log %%D:\gen2convert-setupact.log > nul 2>&1
         copy /y X:\Windows\setuperr.log %%D:\gen2convert-setuperr.log > nul 2>&1
     )
@@ -72,11 +75,12 @@ wpeutil shutdown
 finally {
     Write-Host '4/5 Committing boot.wim...'
     dism /Unmount-Image /MountDir:"$mount" /Commit | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "dism unmount/commit failed (exit $LASTEXITCODE) - do NOT use any ISO built from this run." }
 }
 
 Write-Host '5/5 Building ISO...'
 cmd /c "`"$env2`" && MakeWinPEMedia /ISO $work $work\gen2convert.iso" | Out-Null
-if (-not (Test-Path "$work\gen2convert.iso")) { throw 'MakeWinPEMedia failed - no ISO produced.' }
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$work\gen2convert.iso")) { throw "MakeWinPEMedia failed (exit $LASTEXITCODE)." }
 
 Write-Host ''
 Write-Host "DONE: $work\gen2convert.iso"

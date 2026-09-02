@@ -79,6 +79,12 @@ are never modified — they are the rollback.
 **Never run VM01 and VM01-temp/VM01-old at the same time** — same hostname, IP,
 and (static) MAC. Rollback = confirm the new VM is OFF, then start the old one.
 
+**`-InPlace` mode changes the rollback story:** it converts the ORIGINAL disk
+(irreversible; requires `-BackupVerified`). The old shell ends up diskless and
+is NOT a rollback. Rollback = restore the backup, or rebuild a Gen1 VM from
+the MBR fallback copies kept in the `-temp` folder — keep that folder until
+decommission. Copy/PE mode keeps the original untouched as before.
+
 **Disk state at every handoff:** original disks stay MBR and untouched through
 all steps; only the copies in `...\VM01-temp\` are ever converted to GPT.
 

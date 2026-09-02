@@ -76,7 +76,11 @@ try {
     if ($orig) {
         Check 'vCPU matches original'   ($vm.CPUCount -eq $orig.CPUCount) "$($vm.CPUCount) vs $($orig.CPUCount)"
         Check 'Memory matches original' ($vm.Memory -eq $orig.Memory) "$($vm.Memory)MB vs $($orig.Memory)MB"
-        Check 'Disk count matches'      ($vm.VirtualDiskDrives.Count -eq $orig.VirtualDiskDrives.Count) "$($vm.VirtualDiskDrives.Count) vs $($orig.VirtualDiskDrives.Count)"
+        if ($orig.VirtualDiskDrives.Count -gt 0) {
+            Check 'Disk count matches'  ($vm.VirtualDiskDrives.Count -eq $orig.VirtualDiskDrives.Count) "$($vm.VirtualDiskDrives.Count) vs $($orig.VirtualDiskDrives.Count)"
+        } else {
+            Log "SKIP  Disk count vs original - original shell is diskless (in-place handoff); new VM has $($vm.VirtualDiskDrives.Count) disk(s)"
+        }
         Check 'NIC count matches'       ($vm.VirtualNetworkAdapters.Count -eq $orig.VirtualNetworkAdapters.Count) "$($vm.VirtualNetworkAdapters.Count) vs $($orig.VirtualNetworkAdapters.Count)"
         Check 'Original left OFF'       ($orig.VirtualMachineState -eq 'PowerOff') "original is $($orig.VirtualMachineState) - both up = IP/name conflict risk"
     } else {
