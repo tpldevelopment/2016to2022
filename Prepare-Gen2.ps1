@@ -43,7 +43,8 @@ function Send-Report($subject) {
     } catch { Write-Warning "Email failed: $_" }
 }
 
-$guestCred = Get-Credential -Message "GUEST admin credentials for $VMName"
+# One prompt: your own password. Same account is used for the in-guest steps.
+$guestCred = Get-Credential -UserName "$env:USERDOMAIN\$env:USERNAME" -Message "Password for $env:USERDOMAIN\$env:USERNAME"
 
 try {
     Import-Module VirtualMachineManager -ErrorAction Stop
