@@ -82,15 +82,19 @@ and (static) MAC. Rollback = confirm the new VM is OFF, then start the old one.
 **Disk state at every handoff:** original disks stay MBR and untouched through
 all steps; only the copies in `...\VM01-temp\` are ever converted to GPT.
 
-**Refused by the script (handle manually):** clustered/HA VMs, VMs with
-checkpoints or differencing-disk chains, ambiguous VM names, NICs bound only to
-VMM VM networks, nonstandard boot layout (boot disk not at IDE 0:0).
+**Refused by the script (handle manually):** VMs with checkpoints or
+differencing-disk chains, ambiguous VM names, nonstandard boot layout (boot
+disk not at IDE 0:0), NICs with no VMM network binding at all.
 
-**Not carried to the new VM:** VMM cloud/owner/custom properties, port
-classifications, IP-pool assignments, checkpoint policy, CPU limits/weights,
-memory buffer/priority, automatic start/stop actions, NIC security/offload
-settings, original disk controller layout (data disks re-attach in order on
-SCSI). Static MACs and access VLANs ARE carried.
+**Fully SCVMM-native:** the new VM is created THROUGH VMM (hardware profile
++ JobGroup), so it is VMM-owned from birth. Carried: CPU/RAM/dynamic memory,
+VM networks (or vSwitch fallback), VLANs, static MACs, port classifications,
+and the HA flag (HA path untested - pilot on non-HA first).
+
+**Not carried:** VMM cloud/owner/custom properties, IP-pool assignments,
+checkpoint policy, CPU limits/weights, memory buffer/priority, automatic
+start/stop actions, NIC security/offload settings, original disk controller
+layout (all disks re-attach in order on SCSI 0).
 
 **BitLocker VMs:** do NOT pilot BitLocker-enabled VMs until the protector
 workflow is validated. After conversion, Microsoft guidance is to DELETE and

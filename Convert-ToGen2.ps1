@@ -88,22 +88,24 @@ try {
     Log "Resolved: '$VMName' ID $($vm.ID) on host $hvHost | Gen $($vm.Generation) | $($vm.VirtualMachineState) | vCPU $($vm.CPUCount) | RAM $($vm.Memory)MB"
 
     if ($vm.Generation -eq 2) { throw "'$VMName' is already Generation 2." }
-    if ($vm.IsHighlyAvailable) { throw "'$VMName' is CLUSTERED/HA - refused. Convert HA VMs via the manual VMM path." }
+    if ($vm.IsHighlyAvailable) { Log "'$VMName' is HA/clustered - the new VM will be created through VMM as highly available. Pilot on non-HA first; HA path is untested." }
     if (Get-SCVirtualMachine -Name $NewName)     { throw "'$NewName' already exists in VMM - clean up first." }
     if (Get-SCVirtualMachine -Name $StagingName) { throw "'$StagingName' already exists in VMM - clean up first." }
     if ($vm.VMCheckpoints.Count -gt 0) {
         throw "'$VMName' has $($vm.VMCheckpoints.Count) VMM checkpoint(s). Delete them, wait for the merge, rerun."
     }
 
+    # NICs rebuilt VMM-natively: VM network binding preferred, vSwitch fallback,
+    # VLAN + static MAC + port classification carried.
     $nicSpec = @($vm.VirtualNetworkAdapters | ForEach-Object {
         @{ Switch = "$($_.VirtualNetwork)"; VlanEnabled = $_.VLanEnabled; Vlan = $_.VLanID
            Mac = $_.MACAddress; MacStatic = ($_.MACAddressType -eq 'Static')
-           VMNetwork = "$($_.VMNetwork)" } })
+           VMNetwork = "$($_.VMNetwork)"; PortClass = "$($_.PortClassification)" } })
     foreach ($n in $nicSpec) {
-        if ([string]::IsNullOrWhiteSpace($n.Switch)) {
-            throw "A NIC on '$VMName' is bound only to VM network '$($n.VMNetwork)' (no VirtualNetwork). This script maps NICs by host vSwitch name - handle manually."
+        if ([string]::IsNullOrWhiteSpace($n.Switch) -and [string]::IsNullOrWhiteSpace($n.VMNetwork)) {
+            throw "A NIC on '$VMName' has neither a VirtualNetwork nor a VMNetwork - cannot rebuild it."
         }
-        Log "NIC: switch '$($n.Switch)' VLAN $(if ($n.VlanEnabled) { $n.Vlan } else { 'none' }) MAC $($n.Mac) ($(if ($n.MacStatic) {'static, carried over'} else {'dynamic - guest may re-detect NIC'}))"
+        Log "NIC: $(if ($n.VMNetwork) { "VM network '$($n.VMNetwork)'" } else { "vSwitch '$($n.Switch)'" }) VLAN $(if ($n.VlanEnabled) { $n.Vlan } else { 'none' }) MAC $($n.Mac) ($(if ($n.MacStatic) {'static, carried over'} else {'dynamic - guest may re-detect NIC'}))$(if ($n.PortClass) { " port-class '$($n.PortClass)'" })"
     }
 
     # Host-side preflight: disks (controller positions, format, chains),
@@ -132,7 +134,17 @@ try {
             }
         }
         [pscustomobject]@{ VMPath = $hostVm.Path; Disks = $disks }
-    } -ArgumentList $VMName, $NewName, $StagingName, @($nicSpec | ForEach-Object { $_.Switch } | Select-Object -Unique)
+    } -ArgumentList $VMName, $NewName, $StagingName, @($nicSpec | Where-Object { -not $_.VMNetwork -and $_.Switch } | ForEach-Object { $_.Switch } | Select-Object -Unique)
+
+    # VMM-side network object resolution (fail in preflight, not at build time)
+    foreach ($n in $nicSpec) {
+        if ($n.VMNetwork) {
+            if (@(Get-SCVMNetwork -Name $n.VMNetwork).Count -lt 1) { throw "VM network '$($n.VMNetwork)' not found in VMM." }
+        }
+        if ($n.PortClass) {
+            if (@(Get-SCPortClassification -Name $n.PortClass).Count -lt 1) { throw "Port classification '$($n.PortClass)' not found in VMM." }
+        }
+    }
 
     $diskInfo = @($hp.Disks)
     $diskInfo | ForEach-Object { Log "Disk: $($_.Controller) $($_.Path) [$($_.Format)/$($_.VhdType), $($_.FileSizeGB)GB$(if ($_.IsBoot) { ', BOOT' })]" }
@@ -383,58 +395,66 @@ try {
     # PHASE 4 - BUILD THE GEN2 VM
     # =========================================================================
     $phase = 'build'
-    Log "Building Gen2 VM '$NewName'..."
-    $spec = @{
-        Name = $NewName; Dir = $newDir; BootDisk = $bootCopy
-        OtherDisks = @($copyPlan | Where-Object { -not $_.IsBoot } | ForEach-Object { $_.Dst })
-        CPU = $vm.CPUCount; MemoryMB = $vm.Memory
-        DynMem = $vm.DynamicMemoryEnabled; DynMinMB = $vm.DynamicMemoryMinimumMB; DynMaxMB = $vm.DynamicMemoryMaximumMB
-        Nics = $nicSpec
+    Log "Building Gen2 VM '$NewName' THROUGH VMM (fully VMM-managed, HA carried)..."
+    $jobGroup = [guid]::NewGuid().Guid
+    $hwName   = "tmp-$NewName-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    $hwProfile = $null
+    try {
+        # Hardware profile: generation, CPU, memory (+dynamic), Secure Boot
+        $hwArgs = @{
+            Name = $hwName; Generation = 2
+            CPUCount = $vm.CPUCount; MemoryMB = $vm.Memory
+            SecureBootEnabled = $true; SecureBootTemplate = 'MicrosoftWindows'
+        }
+        if ($vm.DynamicMemoryEnabled) {
+            $hwArgs['DynamicMemoryEnabled'] = $true
+            $hwArgs['DynamicMemoryMinimumMB'] = $vm.DynamicMemoryMinimumMB
+            $hwArgs['DynamicMemoryMaximumMB'] = $vm.DynamicMemoryMaximumMB
+        }
+        $hwProfile = New-SCHardwareProfile @hwArgs
+
+        # Disks: boot disk at SCSI 0:0, data disks in order after it
+        $lun = 0
+        foreach ($p in @($copyPlan | Where-Object IsBoot) + @($copyPlan | Where-Object { -not $_.IsBoot })) {
+            New-SCVirtualDiskDrive -SCSI -Bus 0 -LUN $lun -JobGroup $jobGroup `
+                -UseLocalVirtualHardDisk -Path (Split-Path $p.Dst) -FileName (Split-Path $p.Dst -Leaf) | Out-Null
+            $lun++
+        }
+
+        # NICs: VM-network binding preferred; vSwitch fallback; VLAN/MAC/port class carried
+        foreach ($n in $nicSpec) {
+            $nicArgs = @{ JobGroup = $jobGroup }
+            if ($n.VMNetwork) { $nicArgs['VMNetwork'] = Get-SCVMNetwork -Name $n.VMNetwork | Select-Object -First 1 }
+            elseif ($n.Switch) { $nicArgs['VirtualNetwork'] = $n.Switch }
+            if ($n.VlanEnabled) { $nicArgs['VLanEnabled'] = $true; $nicArgs['VLanID'] = $n.Vlan }
+            if ($n.MacStatic -and $n.Mac) { $nicArgs['MACAddress'] = $n.Mac; $nicArgs['MACAddressType'] = 'Static' }
+            if ($n.PortClass) { $nicArgs['PortClassification'] = Get-SCPortClassification -Name $n.PortClass | Select-Object -First 1 }
+            New-SCVirtualNetworkAdapter @nicArgs | Out-Null
+        }
+
+        $newVm = New-SCVirtualMachine -Name $NewName -VMHost (Get-SCVMHost -ComputerName $hvHost) `
+            -Path $parentDir -HardwareProfile $hwProfile -JobGroup $jobGroup `
+            -UseLocalVirtualHardDisk -HighlyAvailable $vm.IsHighlyAvailable -ErrorAction Stop
+        if (-not $newVm) { throw "New-SCVirtualMachine returned nothing - check the VMM job log." }
     }
-    Invoke-Command -ComputerName $hvHost -ScriptBlock {
-        param($s)
-        $ErrorActionPreference = 'Stop'
-        New-VM -Name $s.Name -Generation 2 -Path $s.Dir -MemoryStartupBytes ([int64]$s.MemoryMB * 1MB) -VHDPath $s.BootDisk | Out-Null
-        Set-VMProcessor -VMName $s.Name -Count $s.CPU
-        if ($s.DynMem) {
-            Set-VMMemory -VMName $s.Name -DynamicMemoryEnabled $true `
-                -MinimumBytes ([int64]$s.DynMinMB * 1MB) -MaximumBytes ([int64]$s.DynMaxMB * 1MB)
-        }
-        foreach ($d in $s.OtherDisks) { Add-VMHardDiskDrive -VMName $s.Name -Path $d }
-        Get-VMNetworkAdapter -VMName $s.Name | Remove-VMNetworkAdapter
-        foreach ($n in $s.Nics) {
-            $nic = Add-VMNetworkAdapter -VMName $s.Name -SwitchName $n.Switch -Passthru
-            if ($n.MacStatic -and $n.Mac) { Set-VMNetworkAdapter -VMNetworkAdapter $nic -StaticMacAddress ($n.Mac -replace '[:-]','') }
-            if ($n.VlanEnabled) { Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Access -VlanId $n.Vlan }
-        }
-        Set-VMFirmware -VMName $s.Name -EnableSecureBoot On
-    } -ArgumentList $spec
-    Log "Gen2 VM '$NewName' built: $($vm.CPUCount) vCPU, $($vm.Memory)MB, $($copyPlan.Count) disk(s), $($nicSpec.Count) NIC(s), Secure Boot on."
+    finally {
+        if ($hwProfile) { Remove-SCHardwareProfile -HardwareProfile $hwProfile -ErrorAction SilentlyContinue | Out-Null }
+    }
+    Log "Gen2 VM '$NewName' built via VMM: $($vm.CPUCount) vCPU, $($vm.Memory)MB, $($copyPlan.Count) disk(s), $($nicSpec.Count) NIC(s), Secure Boot on, HighlyAvailable=$($vm.IsHighlyAvailable)."
 
     # =========================================================================
     # PHASE 5 - START + VMM REFRESH (verified) + REPORT
     # =========================================================================
     $phase = 'finish'
-    if ($StartAfter) {
-        Invoke-Command -ComputerName $hvHost -ScriptBlock {
-            param($n)
-            $ErrorActionPreference = 'Stop'
-            Start-VM -Name $n
-        } -ArgumentList $NewName
-        Log "'$NewName' started."
-    }
-    Get-SCVMHost -ComputerName $hvHost | Read-SCVMHost | Out-Null
+    # VM was created BY VMM, so it is VMM-owned from birth - no refresh dance
     $inVmm = @(Get-SCVirtualMachine -Name $NewName)
-    if ($inVmm.Count -ne 1) {
-        Start-Sleep -Seconds 30      # one retry - refresh can lag
-        Get-SCVMHost -ComputerName $hvHost | Read-SCVMHost | Out-Null
-        $inVmm = @(Get-SCVirtualMachine -Name $NewName)
+    if ($inVmm.Count -ne 1) { throw "VMM reports $($inVmm.Count) VMs named '$NewName' after creation - inspect the VMM job log before proceeding." }
+    Log "'$NewName' is VMM-managed (ID $($inVmm[0].ID), HighlyAvailable=$($inVmm[0].IsHighlyAvailable))."
+    if ($StartAfter) {
+        Start-SCVirtualMachine -VM $inVmm[0] -ErrorAction Stop | Out-Null
+        Log "'$NewName' started via VMM."
     }
-    if ($inVmm.Count -ne 1) {
-        throw "Conversion built and $(if ($StartAfter) {'started'} else {'left off'}) '$NewName' on $hvHost, but VMM discovery failed ($($inVmm.Count) matches after 2 refreshes). Treating as INCOMPLETE - resolve VMM discovery before proceeding."
-    }
-    Log "VMM refresh verified - '$NewName' is in the console (ID $($inVmm[0].ID))."
-    Log "NOT carried over: VMM cloud/owner/custom properties, port classifications, IP-pool assignments, checkpoint policy, CPU limits/weights, memory buffer/priority, automatic start/stop actions, NIC security/offload settings, original disk controller layout (data disks re-attached in order on SCSI)."
+    Log "NOT carried over: VMM cloud/owner/custom properties, IP-pool assignments, checkpoint policy, CPU limits/weights, memory buffer/priority, automatic start/stop actions, NIC security/offload settings, original disk controller layout (all disks re-attach in order on SCSI 0). Carried: CPU/RAM/dynamic memory, VM networks or vSwitch, VLANs, static MACs, port classifications, HA flag."
     if ($blOn.Count) { Log "BitLocker was ON - Verify-Gen2 gates on protection resuming in the Gen2 VM; confirm recovery-key escrow." }
     Log "Original '$VMName' left OFF as rollback. NEVER start it while '$NewName' runs (same hostname/IP/MAC)."
     Log "SUCCESS. Next: .\Verify-Gen2.ps1 -VMName $VMName"
