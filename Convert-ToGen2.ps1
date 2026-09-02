@@ -158,7 +158,7 @@ try {
     $copyPlan = foreach ($d in $diskInfo) {
         $leaf = Split-Path $d.Path -Leaf
         $finalLeaf = if ($d.Format -eq 'VHD') { [IO.Path]::GetFileNameWithoutExtension($leaf) + '.vhdx' } else { $leaf }
-        if ($leafSeen.ContainsKey($finalLeaf.ToLower())) { $finalLeaf = "d$i-$finalLeaf" }
+        while ($leafSeen.ContainsKey($finalLeaf.ToLower())) { $finalLeaf = "d$i-$finalLeaf" }   # loop until actually unique
         $leafSeen[$finalLeaf.ToLower()] = $true
         $i++
         [pscustomobject]@{
@@ -167,6 +167,9 @@ try {
             Dst = Join-Path $newDir $finalLeaf
         }
     }
+
+    $dups = @($copyPlan | Group-Object { $_.Dst.ToLower() } | Where-Object Count -gt 1)
+    if ($dups) { throw "Internal error: duplicate copy destinations generated: $(($dups.Name) -join ', ')" }
 
     # Space: all copies + temporary .vhd intermediates exist simultaneously
     $needGB = [math]::Round((($copyPlan | Measure-Object SizeGB -Sum).Sum +
@@ -252,23 +255,27 @@ try {
     $phase = 'copy'
     Log "Copying $($copyPlan.Count) disk(s) to $newDir ..."
     Invoke-Command -ComputerName $hvHost -ScriptBlock {
-        param($plan, $dir)
+        param($plan, $dir, $vmName)
         $ErrorActionPreference = 'Stop'
+        # Revalidate: the disk set must not have changed between preflight and now
+        $current = @((Get-VMHardDiskDrive -VMName $vmName).Path | Sort-Object)
+        $planned = @($plan.Src | Sort-Object)
+        if (Compare-Object $current $planned) { throw "Disk set on '$vmName' changed since preflight (now: $($current -join ', ')). Rerun." }
         New-Item -Path $dir -ItemType Directory | Out-Null
         foreach ($p in $plan) {
             if ($p.Fmt -eq 'VHD') {
                 # Convert-VHD must not run against an attached disk: copy the
                 # .vhd first, convert the UNATTACHED copy, drop the temp.
-                Copy-Item -Path $p.Src -Destination $p.TempVhd
+                Copy-Item -LiteralPath $p.Src -Destination $p.TempVhd
                 Convert-VHD -Path $p.TempVhd -DestinationPath $p.Dst      # type preserved (no -VHDType override)
-                Remove-Item -Path $p.TempVhd -Force
+                Remove-Item -LiteralPath $p.TempVhd -Force
             } else {
-                Copy-Item -Path $p.Src -Destination $p.Dst
+                Copy-Item -LiteralPath $p.Src -Destination $p.Dst
             }
             $check = Get-VHD -Path $p.Dst      # validates the result is a readable VHDX
             if ($check.VhdFormat -ne 'VHDX') { throw "Post-copy validation failed: $($p.Dst) is $($check.VhdFormat), expected VHDX." }
         }
-    } -ArgumentList $copyPlan, $newDir
+    } -ArgumentList $copyPlan, $newDir, $VMName
     $bootCopy = ($copyPlan | Where-Object IsBoot).Dst
     Log "Copy complete + validated. Boot disk copy: $bootCopy"
 
@@ -300,7 +307,13 @@ try {
                 try {
                     Invoke-Command -VMName $sName -Credential $cred -ScriptBlock { 'ready' } -ErrorAction Stop | Out-Null
                     $ready = $true; break
-                } catch { Start-Sleep -Seconds 15 }
+                } catch {
+                    # Bad credentials are a hard stop - retrying them risks account lockout
+                    if ($_.Exception.Message -match 'credential|password|logon failure|authentication|access is denied') {
+                        throw "PowerShell Direct rejected the supplied credentials: $($_.Exception.Message)"
+                    }
+                    Start-Sleep -Seconds 15
+                }
             }
             if (-not $ready) { throw "PowerShell Direct never became ready in staging (3 min after heartbeat) - check guest credentials." }
             $out.Add('Staging heartbeat + PowerShell Direct ready - converting.')
@@ -310,10 +323,13 @@ try {
                 $r = New-Object System.Collections.Generic.List[string]
                 # BitLocker fail-closed, all volumes
                 if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
-                    foreach ($v in (Get-BitLockerVolume | Where-Object { $_.ProtectionStatus -eq 'On' })) {
-                        Suspend-BitLocker -MountPoint $v.MountPoint | Out-Null
-                        if ((Get-BitLockerVolume -MountPoint $v.MountPoint).ProtectionStatus -eq 'On') { throw "BitLocker suspension FAILED on $($v.MountPoint)." }
-                        $r.Add("BitLocker suspended on $($v.MountPoint).")
+                    foreach ($v in Get-BitLockerVolume) {
+                        if ($v.ProtectionStatus -notin 'On', 'Off') { throw "BitLocker state on $($v.MountPoint) is '$($v.ProtectionStatus)' (unknown) - refusing to convert blind." }
+                        if ($v.ProtectionStatus -eq 'On') {
+                            Suspend-BitLocker -MountPoint $v.MountPoint | Out-Null
+                            if ((Get-BitLockerVolume -MountPoint $v.MountPoint).ProtectionStatus -eq 'On') { throw "BitLocker suspension FAILED on $($v.MountPoint)." }
+                            $r.Add("BitLocker suspended on $($v.MountPoint).")
+                        }
                     }
                 } elseif (Test-Path "$env:windir\System32\manage-bde.exe") {
                     $raw = & "$env:windir\System32\manage-bde.exe" -status 2>&1 | Out-String
@@ -341,17 +357,27 @@ try {
             $out.Add('Staging shut down cleanly.')
         }
         finally {
-            # The staging shell must NEVER outlive this block - running or not.
+            # Best-effort staging cleanup; the caller VERIFIES the result.
             $s = Get-VM -Name $sName -ErrorAction SilentlyContinue
             if ($s) {
                 if ($s.State -ne 'Off') { Stop-VM -Name $sName -TurnOff -Force -ErrorAction SilentlyContinue }
                 Remove-VM -Name $sName -Force -ErrorAction SilentlyContinue   # shell only; disks stay for diagnosis
-                $out.Add('Staging shell removed (cleanup guarantee).')
+                $s2 = Get-VM -Name $sName -ErrorAction SilentlyContinue
+                if ($s2) { $out.Add("STAGING CLEANUP INCOMPLETE: '$sName' still registered, state $($s2.State) - manual cleanup required.") }
+                else     { $out.Add('Staging shell removed (best-effort cleanup verified).') }
             }
         }
         $out
     } -ArgumentList $StagingName, $bootCopy, $newDir, $guestCred
     $stageResult | ForEach-Object { Log $_ }
+
+    # Independent verification: never build the Gen2 VM while a staging shell exists
+    $residual = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+        param($n)
+        $s = Get-VM -Name $n -ErrorAction SilentlyContinue
+        if ($s) { "$($s.State)" } else { $null }
+    } -ArgumentList $StagingName
+    if ($residual) { throw "Staging VM '$StagingName' still exists on the host (state: $residual) after cleanup - remove it manually before rerunning." }
 
     # =========================================================================
     # PHASE 4 - BUILD THE GEN2 VM
@@ -398,11 +424,16 @@ try {
         Log "'$NewName' started."
     }
     Get-SCVMHost -ComputerName $hvHost | Read-SCVMHost | Out-Null
-    if (-not (Get-SCVirtualMachine -Name $NewName)) {
-        Log "WARNING: '$NewName' did not appear in VMM after refresh - re-run a host refresh in the VMM console. The VM itself exists on $hvHost."
-    } else {
-        Log "VMM refresh verified - '$NewName' is in the console."
+    $inVmm = @(Get-SCVirtualMachine -Name $NewName)
+    if ($inVmm.Count -ne 1) {
+        Start-Sleep -Seconds 30      # one retry - refresh can lag
+        Get-SCVMHost -ComputerName $hvHost | Read-SCVMHost | Out-Null
+        $inVmm = @(Get-SCVirtualMachine -Name $NewName)
     }
+    if ($inVmm.Count -ne 1) {
+        throw "Conversion built and $(if ($StartAfter) {'started'} else {'left off'}) '$NewName' on $hvHost, but VMM discovery failed ($($inVmm.Count) matches after 2 refreshes). Treating as INCOMPLETE - resolve VMM discovery before proceeding."
+    }
+    Log "VMM refresh verified - '$NewName' is in the console (ID $($inVmm[0].ID))."
     Log "NOT carried over: VMM cloud/owner/custom properties, port classifications, IP-pool assignments, checkpoint policy, CPU limits/weights, memory buffer/priority, automatic start/stop actions, NIC security/offload settings, original disk controller layout (data disks re-attached in order on SCSI)."
     if ($blOn.Count) { Log "BitLocker was ON - Verify-Gen2 gates on protection resuming in the Gen2 VM; confirm recovery-key escrow." }
     Log "Original '$VMName' left OFF as rollback. NEVER start it while '$NewName' runs (same hostname/IP/MAC)."

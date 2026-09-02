@@ -67,7 +67,7 @@ are never modified — they are the rollback.
 | # | Where | Action |
 |---|---|---|
 | 1 | You | **Manual backup** of the VM. Verify it completed. |
-| 2 | Admin box | `.\Convert-ToGen2.ps1 -VMName VM01 -WhatIf` — full read-only preflight + plan |
+| 2 | Admin box | `.\Convert-ToGen2.ps1 -VMName VM01 -WhatIf` — read-only preflight + plan. Run it while the VM is RUNNING and require **PREFLIGHT PASSED** (a "PASSED WITH GAPS" dry run has not tested guest creds/mbr2gpt/BitLocker) |
 | 3 | Admin box | `.\Convert-ToGen2.ps1 -VMName VM01` — shuts down original, copies disks (VHD→VHDX), converts the COPY in an isolated staging VM (mbr2gpt, no reboot), builds `VM01-temp` as Gen2, starts it, emails report |
 | 4 | Admin box | `.\Verify-Gen2.ps1 -VMName VM01` — basic boot/config checks on `VM01-temp` vs the original |
 | 5 | You | Validate the application/workload. This is not scriptable. |
@@ -87,4 +87,13 @@ checkpoints or differencing-disk chains, ambiguous VM names, NICs bound only to
 VMM VM networks, nonstandard boot layout (boot disk not at IDE 0:0).
 
 **Not carried to the new VM:** VMM cloud/owner/custom properties, port
-classifications, IP-pool assignments, checkpoint policy. Static MACs ARE carried.
+classifications, IP-pool assignments, checkpoint policy, CPU limits/weights,
+memory buffer/priority, automatic start/stop actions, NIC security/offload
+settings, original disk controller layout (data disks re-attach in order on
+SCSI). Static MACs and access VLANs ARE carried.
+
+**BitLocker VMs:** do NOT pilot BitLocker-enabled VMs until the protector
+workflow is validated. After conversion, Microsoft guidance is to DELETE and
+RECREATE protectors, then confirm recovery-key escrow (AD) - Verify-Gen2
+fails if protection has not resumed, but protector recreation + escrow is a
+manual runbook step.

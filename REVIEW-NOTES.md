@@ -51,10 +51,34 @@ Two pass-1 fixes were judged incomplete (VHD conversion, BitLocker).**
 | 11 | Verify could false-pass (silent event log) and false-fail (DCs/workgroup on secure channel) | Event log unreadable = FAIL; secure-channel check skipped on non-members and DCs; ambiguous original name = explicit FAIL, not silent skip |
 | 12 | Wrong mbr2gpt log filename in guidance | Corrected to `%windir%\setupact.log` / `setuperr.log` |
 
-## Pass 3 — final review
+## Pass 3 — final review (2026-09-02)
 
-_(pending)_
+**Verdict: "not safe to pilot as-is" — 4 must-fixes + a BitLocker gate.
+After fixing: approved for a SUPERVISED PILOT on a backed-up, non-HA,
+non-critical, non-BitLocker VM.** Of the 12 pass-2 items it audited:
+6 fixed, 5 partial, 1 unresolved.
 
-## Pass 3 — final review
+Must-fixes and what was done (post-review, same day):
 
-_(pending)_
+| # | Finding | Action taken |
+|---|---|---|
+| 1 | Filename allocator could STILL collide (Codex executed it and proved `data.vhdx, d2-data.vhdx, data.vhdx` → duplicate) | Allocator now loops until the name is actually unused + a grouped-duplicate assertion on the finished plan |
+| 2 | Staging cleanup logged "guarantee" while suppressing failures | Cleanup is now "best-effort + verified": finally re-queries the VM and reports honestly; an independent post-check refuses to build Gen2 while any staging shell exists |
+| 3 | PS Direct retry loop retried bad credentials (lockout risk) | Auth/credential errors now abort immediately; only transport/not-ready errors retry |
+| 4 | Missing VMM discovery still reported SUCCESS | Discovery now verified (with one retried refresh); absence = run FAILS as INCOMPLETE |
+| 5 | BitLocker gate | Verify: unknown state = FAIL (manage-bde fallback added); conversion: any non-On/Off state = abort; README: explicit "no BitLocker VMs in pilot" + protector-recreate/escrow manual step |
+
+Nice-to-haves also applied: README no longer calls -WhatIf a "full" preflight
+(and requires PREFLIGHT PASSED, not PASSED WITH GAPS, before a pilot); loss
+list expanded in README; DNS check skips workgroup machines; `-LiteralPath`
+on copy/remove; disk set revalidated between preflight and copy.
+
+## Where this stands for the pilot
+
+1. Pick a **non-critical, non-HA, non-BitLocker** Gen1 VM with a verified backup
+2. Run `-WhatIf` while it's running — require `PREFLIGHT PASSED` (no gaps)
+3. Run the conversion supervised; follow the README runbook incl. the
+   retention window before deleting the original
+4. Not validated by any reviewer: actual runtime behavior on Hyper-V/SCVMM
+   (no Windows environment available to either reviewer) — the pilot IS the
+   runtime test. Codex also noted there are no Pester tests.

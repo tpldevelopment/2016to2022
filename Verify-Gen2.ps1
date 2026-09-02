@@ -85,14 +85,24 @@ try {
             $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop
             # BitLocker: volumes with protectors configured but protection OFF
             # after conversion = protectors did not resume (a real check, not a log line)
-            $bl = 'no BitLocker tooling'
+            # Fail-closed: unknown BitLocker state is a FAILURE, never a pass
+            $bl = $null
             $blSuspended = @()
+            $blKnown = $false
             if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
                 $vols = Get-BitLockerVolume
                 $bl = ($vols | ForEach-Object { "$($_.MountPoint):$($_.ProtectionStatus)" }) -join ' '
                 $blSuspended = @($vols | Where-Object { $_.KeyProtector.Count -gt 0 -and $_.ProtectionStatus -ne 'On' } |
                                  ForEach-Object { $_.MountPoint })
+                $blKnown = $true
+            } elseif (Test-Path "$env:windir\System32\manage-bde.exe") {
+                $raw = & "$env:windir\System32\manage-bde.exe" -status 2>&1 | Out-String
+                if ($LASTEXITCODE -eq 0) {
+                    $blKnown = $true
+                    $bl = if ($raw -match 'Protection Status:\s*Protection On') { 'protection on (via manage-bde)' } else { 'no protected volumes (via manage-bde)' }
+                }
             }
+            if (-not $blKnown) { $bl = 'STATE UNKNOWN - no BitLocker tooling responded' }
             $sb = $false; try { $sb = Confirm-SecureBootUEFI } catch { $sb = $false }
             # Domain secure channel: only meaningful on domain MEMBERS (skip
             # workgroup boxes and domain controllers - false failures there)
@@ -111,11 +121,12 @@ try {
                 IPs        = (Get-NetIPAddress -AddressFamily IPv4 |
                               Where-Object { $_.IPAddress -notlike '169.254*' -and $_.IPAddress -ne '127.0.0.1' }).IPAddress -join ', '
                 GwPing     = if ($gw) { Test-Connection $gw -Count 1 -Quiet } else { $false }
-                DnsOk      = [bool](Resolve-DnsName -Name $env:USERDNSDOMAIN -ErrorAction SilentlyContinue)
+                DnsOk      = if ($env:USERDNSDOMAIN) { [bool](Resolve-DnsName -Name $env:USERDNSDOMAIN -ErrorAction SilentlyContinue) } else { $null }
                 DomainOk   = $dom
                 DomApplicable = $domApplicable
                 SysErrors  = $sysErrors
                 BitLocker  = $bl
+                BlKnown    = $blKnown
                 BlSuspended = $blSuspended
                 StoppedAutoSvcs = (Get-Service | Where-Object {
                                       $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running' -and
@@ -130,14 +141,18 @@ try {
     Check 'Firmware UEFI'  ($g.G.Firmware -eq 'Uefi') "$($g.G.Firmware)"
     Check 'Secure Boot'    ($g.G.SecureBoot) "guest reports $($g.G.SecureBoot)"
     Check 'Network'        ($g.G.GwPing) "IPs: $($g.G.IPs) | gateway ping: $($g.G.GwPing)"
-    Check 'DNS resolves'   ($g.G.DnsOk) "domain lookup $(if ($g.G.DnsOk) {'ok'} else {'FAILED'})"
+    if ($null -ne $g.G.DnsOk) { Check 'DNS resolves' ($g.G.DnsOk) "domain lookup $(if ($g.G.DnsOk) {'ok'} else {'FAILED'})" }
+    else { Log "SKIP  DNS check - no DNS domain (workgroup machine)" }
     if ($g.G.DomApplicable) {
         Check 'Domain channel' ($g.G.DomainOk) "secure channel $(if ($g.G.DomainOk) {'ok'} else {'broken - Test-ComputerSecureChannel -Repair'})"
     } else {
         Log "SKIP  Domain channel - not applicable (workgroup or domain controller)"
     }
     Check 'System log readable+clean' ($g.G.SysErrors -eq 0) $(if ($g.G.SysErrors -lt 0) { 'event log UNREADABLE' } else { "$($g.G.SysErrors) critical/error events in the last hour" })
-    Check 'BitLocker resumed' ($g.G.BlSuspended.Count -eq 0) $(if ($g.G.BlSuspended.Count) { "protectors configured but protection OFF on: $($g.G.BlSuspended -join ', ') - resume + verify key escrow" } else { "$($g.G.BitLocker)" })
+    Check 'BitLocker state' ($g.G.BlKnown -and $g.G.BlSuspended.Count -eq 0) $(
+        if (-not $g.G.BlKnown) { "$($g.G.BitLocker) - confirm manually before any decommission" }
+        elseif ($g.G.BlSuspended.Count) { "protectors configured but protection OFF on: $($g.G.BlSuspended -join ', ') - recreate protectors + verify key escrow" }
+        else { "$($g.G.BitLocker)" })
     Check 'Auto services'  ([string]::IsNullOrEmpty($g.G.StoppedAutoSvcs)) `
         $(if ($g.G.StoppedAutoSvcs) { "NOT running: $($g.G.StoppedAutoSvcs)" } else { 'all running' })
     Log "OS: $($g.G.OS)"
