@@ -56,3 +56,29 @@ Deploy each: **Deploy Once → add server name → Deploy Now**.
   upgrade procedures.
 - Upgrade failed? Read `C:\$WINDOWS.~BT\Sources\Panther\setupact.log` /
   `setuperr.log` on the target.
+
+---
+
+# Gen1 → Gen2 VM Conversion (SCVMM)
+
+**Authoritative runbook.** Copy-first design: the original VM and its MBR disks
+are never modified — they are the rollback.
+
+| # | Where | Action |
+|---|---|---|
+| 1 | You | **Manual backup** of the VM. Verify it completed. |
+| 2 | Admin box | `.\Convert-ToGen2.ps1 -VMName VM01 -WhatIf` — full read-only preflight + plan |
+| 3 | Admin box | `.\Convert-ToGen2.ps1 -VMName VM01` — shuts down original, copies disks (VHD→VHDX), converts the COPY in an isolated staging VM (mbr2gpt, no reboot), builds `VM01-temp` as Gen2, starts it, emails report |
+| 4 | Admin box | `.\Verify-Gen2.ps1 -VMName VM01` — basic boot/config checks on `VM01-temp` vs the original |
+| 5 | You | Validate the application/workload. This is not scriptable. |
+| 6 | VMM GUI | Rename `VM01`→`VM01-old`, `VM01-temp`→`VM01`; delete `VM01-old` (removes its disks); backup the new VM01 |
+
+**Disk state at every handoff:** original disks stay MBR and untouched through
+all steps; only the copies in `...\VM01-temp\` are ever converted to GPT.
+
+**Refused by the script (handle manually):** clustered/HA VMs, VMs with
+checkpoints or differencing-disk chains, ambiguous VM names, NICs bound only to
+VMM VM networks, nonstandard boot layout (boot disk not at IDE 0:0).
+
+**Not carried to the new VM:** VMM cloud/owner/custom properties, port
+classifications, IP-pool assignments, checkpoint policy. Static MACs ARE carried.
