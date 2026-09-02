@@ -136,15 +136,19 @@ try {
         [pscustomobject]@{ VMPath = $hostVm.Path; Disks = $disks }
     } -ArgumentList $VMName, $NewName, $StagingName, @($nicSpec | Where-Object { -not $_.VMNetwork -and $_.Switch } | ForEach-Object { $_.Switch } | Select-Object -Unique)
 
-    # VMM-side network object resolution (fail in preflight, not at build time)
+    # VMM-side network object resolution (fail in preflight, not at build
+    # time; require EXACTLY one match - ambiguous names are unsafe)
     foreach ($n in $nicSpec) {
         if ($n.VMNetwork) {
-            if (@(Get-SCVMNetwork -Name $n.VMNetwork).Count -lt 1) { throw "VM network '$($n.VMNetwork)' not found in VMM." }
+            $c = @(Get-SCVMNetwork -Name $n.VMNetwork).Count
+            if ($c -ne 1) { throw "VM network '$($n.VMNetwork)' resolves to $c objects in VMM - need exactly 1." }
         }
         if ($n.PortClass) {
-            if (@(Get-SCPortClassification -Name $n.PortClass).Count -lt 1) { throw "Port classification '$($n.PortClass)' not found in VMM." }
+            $c = @(Get-SCPortClassification -Name $n.PortClass).Count
+            if ($c -ne 1) { throw "Port classification '$($n.PortClass)' resolves to $c objects in VMM - need exactly 1." }
         }
     }
+    if ($diskInfo.Count -gt 64) { throw "VM has $($diskInfo.Count) disks - more than one SCSI controller's 64-device limit. Handle manually." }
 
     $diskInfo = @($hp.Disks)
     $diskInfo | ForEach-Object { Log "Disk: $($_.Controller) $($_.Path) [$($_.Format)/$($_.VhdType), $($_.FileSizeGB)GB$(if ($_.IsBoot) { ', BOOT' })]" }
@@ -405,6 +409,7 @@ try {
             Name = $hwName; Generation = 2
             CPUCount = $vm.CPUCount; MemoryMB = $vm.Memory
             SecureBootEnabled = $true; SecureBootTemplate = 'MicrosoftWindows'
+            FirstBootDevice = 'SCSI,0,0'      # deterministic Gen2 firmware boot entry
         }
         if ($vm.DynamicMemoryEnabled) {
             $hwArgs['DynamicMemoryEnabled'] = $true
@@ -413,17 +418,23 @@ try {
         }
         $hwProfile = New-SCHardwareProfile @hwArgs
 
-        # Disks: boot disk at SCSI 0:0, data disks in order after it
+        # Disks: boot disk at SCSI 0:0 (marked boot/system), data disks after it
         $lun = 0
         foreach ($p in @($copyPlan | Where-Object IsBoot) + @($copyPlan | Where-Object { -not $_.IsBoot })) {
-            New-SCVirtualDiskDrive -SCSI -Bus 0 -LUN $lun -JobGroup $jobGroup `
-                -UseLocalVirtualHardDisk -Path (Split-Path $p.Dst) -FileName (Split-Path $p.Dst -Leaf) | Out-Null
+            $dArgs = @{
+                SCSI = $true; Bus = 0; LUN = $lun; JobGroup = $jobGroup
+                UseLocalVirtualHardDisk = $true
+                Path = (Split-Path $p.Dst); FileName = (Split-Path $p.Dst -Leaf)
+            }
+            if ($p.IsBoot) { $dArgs['BootVolume'] = $true; $dArgs['SystemVolume'] = $true }
+            New-SCVirtualDiskDrive @dArgs | Out-Null
             $lun++
         }
 
-        # NICs: VM-network binding preferred; vSwitch fallback; VLAN/MAC/port class carried
+        # NICs: SYNTHETIC (Gen2 does not support emulated adapters - VMM's
+        # default); VM-network binding preferred; VLAN/MAC/port class carried
         foreach ($n in $nicSpec) {
-            $nicArgs = @{ JobGroup = $jobGroup }
+            $nicArgs = @{ JobGroup = $jobGroup; Synthetic = $true }
             if ($n.VMNetwork) { $nicArgs['VMNetwork'] = Get-SCVMNetwork -Name $n.VMNetwork | Select-Object -First 1 }
             elseif ($n.Switch) { $nicArgs['VirtualNetwork'] = $n.Switch }
             if ($n.VlanEnabled) { $nicArgs['VLanEnabled'] = $true; $nicArgs['VLanID'] = $n.Vlan }
@@ -449,7 +460,13 @@ try {
     # VM was created BY VMM, so it is VMM-owned from birth - no refresh dance
     $inVmm = @(Get-SCVirtualMachine -Name $NewName)
     if ($inVmm.Count -ne 1) { throw "VMM reports $($inVmm.Count) VMs named '$NewName' after creation - inspect the VMM job log before proceeding." }
-    Log "'$NewName' is VMM-managed (ID $($inVmm[0].ID), HighlyAvailable=$($inVmm[0].IsHighlyAvailable))."
+    # Post-create verification: what VMM actually built
+    $built = $inVmm[0]
+    if ($built.Generation -ne 2) { throw "Post-create check: '$NewName' is Generation $($built.Generation), expected 2." }
+    if ($built.VirtualDiskDrives.Count -ne $copyPlan.Count) { throw "Post-create check: '$NewName' has $($built.VirtualDiskDrives.Count) disks, expected $($copyPlan.Count)." }
+    if ($built.VirtualNetworkAdapters.Count -ne $nicSpec.Count) { throw "Post-create check: '$NewName' has $($built.VirtualNetworkAdapters.Count) NICs, expected $($nicSpec.Count)." }
+    if ($built.IsHighlyAvailable -ne $vm.IsHighlyAvailable) { throw "Post-create check: HA is $($built.IsHighlyAvailable), expected $($vm.IsHighlyAvailable)." }
+    Log "'$NewName' is VMM-managed and verified (ID $($built.ID), Gen $($built.Generation), $($built.VirtualDiskDrives.Count) disks, $($built.VirtualNetworkAdapters.Count) NICs, HighlyAvailable=$($built.IsHighlyAvailable))."
     if ($StartAfter) {
         Start-SCVirtualMachine -VM $inVmm[0] -ErrorAction Stop | Out-Null
         Log "'$NewName' started via VMM."

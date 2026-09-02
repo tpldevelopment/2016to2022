@@ -73,6 +73,25 @@ Nice-to-haves also applied: README no longer calls -WhatIf a "full" preflight
 list expanded in README; DNS check skips workgroup machines; `-LiteralPath`
 on copy/remove; disk set revalidated between preflight and copy.
 
+## SCVMM addendum — VMM-native build + targeted verification (2026-09-02)
+
+Requirement added after pass 3: **"fully supported on SCVMM."** Phase 4 was
+rebuilt to create the VM THROUGH VMM (New-SCHardwareProfile + JobGroup +
+New-SCVirtualDiskDrive/-SCVirtualNetworkAdapter + New-SCVirtualMachine).
+Bonus: VM networks and port classifications now carry, and HA VMs are no
+longer refused (HA flag carried; HA path still untested).
+
+A targeted Codex pass verified every cmdlet parameter combination against
+Microsoft's 2019/2022/2025 VMM docs. Result: parameter sets valid, plus:
+
+| Finding | Action taken |
+|---|---|
+| **P1: NIC defaulted to EMULATED — Gen2 only supports synthetic; build would fail on any VM with NICs** | `-Synthetic $true` added |
+| P1: boot order not deterministic | `FirstBootDevice = 'SCSI,0,0'` in the hardware profile + boot disk marked `-BootVolume -SystemVolume` |
+| P2: >64 disks overflow SCSI controller 0 | Preflight guard added |
+| P2: network-object lookups accepted ambiguous names | Exactly-one resolution enforced |
+| P2: no post-create verification | Generation/disk count/NIC count/HA verified against expectations before start |
+
 ## Where this stands for the pilot
 
 1. Pick a **non-critical, non-HA, non-BitLocker** Gen1 VM with a verified backup
