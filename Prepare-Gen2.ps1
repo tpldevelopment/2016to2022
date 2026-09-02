@@ -12,11 +12,17 @@
     .\Prepare-Gen2.ps1 -VMName VM01
     (prompts for guest admin credentials)
 
+    .\Prepare-Gen2.ps1 -VMName VM01 -WhatIf
+    Dry run: connects, checks BitLocker state, runs mbr2gpt /validate
+    (read-only) in the guest, reports what WOULD happen. Converts nothing,
+    reboots nothing, no email.
+
 .PREREQS
     - SCVMM console module on this box; WinRM/admin to the owning Hyper-V host
     - Guest must be running, 64-bit, Server 2019+/Win10+ (needs mbr2gpt.exe)
 #>
 
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory = $true)]
     [string]$VMName
@@ -54,18 +60,24 @@ try {
     if ($vm.Generation -eq 2) { throw "'$VMName' is already Generation 2." }
     if ($vm.VirtualMachineState -ne 'Running') { throw "'$VMName' must be RUNNING for in-guest conversion (state: $($vm.VirtualMachineState))." }
     $hvHost = $vm.VMHost.Name
-    Log "'$VMName' on host $hvHost - starting in-guest conversion via PowerShell Direct."
+    $doIt = $PSCmdlet.ShouldProcess($VMName, 'mbr2gpt /convert + reboot')
+    Log "'$VMName' on host $hvHost - $(if ($doIt) { 'starting in-guest conversion' } else { 'DRY RUN (validate only)' }) via PowerShell Direct."
 
     $result = Invoke-Command -ComputerName $hvHost -ScriptBlock {
-        param($name, $cred)
+        param($name, $cred, $doIt)
         Invoke-Command -VMName $name -Credential $cred -ScriptBlock {
+            param($doIt)
             $out = New-Object System.Collections.Generic.List[string]
 
-            # BitLocker: check, suspend if on
+            # BitLocker: check; suspend only on a real run
             $blv = Get-BitLockerVolume -MountPoint C: -ErrorAction SilentlyContinue
             if ($blv -and $blv.ProtectionStatus -eq 'On') {
-                Suspend-BitLocker -MountPoint C: | Out-Null
-                $out.Add('BitLocker: was ON - suspended for conversion (re-arms on reboot).')
+                if ($doIt) {
+                    Suspend-BitLocker -MountPoint C: | Out-Null
+                    $out.Add('BitLocker: was ON - suspended for conversion (re-arms on reboot).')
+                } else {
+                    $out.Add('BitLocker: ON - WOULD suspend for conversion.')
+                }
             } else {
                 $out.Add('BitLocker: off/not present - nothing to do.')
             }
@@ -75,11 +87,15 @@ try {
                 throw 'mbr2gpt.exe not found - guest OS too old (needs 2019+/Win10+). Upgrade the OS first.'
             }
 
-            # Validate
+            # Validate (read-only, runs in both modes)
             $v = & "$env:windir\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
             $out.Add("validate: $($v -join ' | ')")
             if ($LASTEXITCODE -ne 0) {
                 throw "mbr2gpt VALIDATE FAILED (exit $LASTEXITCODE) - disk not converted. See C:\Windows\mbr2gpt.log in the guest."
+            }
+            if (-not $doIt) {
+                $out.Add('WOULD run: mbr2gpt /convert /allowFullOS, then reboot. (validation passed - real run should succeed)')
+                return $out
             }
 
             # Convert
@@ -90,9 +106,14 @@ try {
             }
             $out.Add('Conversion complete - disk is now GPT/UEFI.')
             $out
-        }
-    } -ArgumentList $VMName, $guestCred
+        } -ArgumentList $doIt
+    } -ArgumentList $VMName, $guestCred, $doIt
     $result | ForEach-Object { Log $_ }
+
+    if (-not $doIt) {
+        Log "DRY RUN complete - nothing was changed, no email sent."
+        exit 0
+    }
 
     # Reboot (step 5a) and wait for the guest to come back
     Log "Rebooting '$VMName' to confirm it still boots..."

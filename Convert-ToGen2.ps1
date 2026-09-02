@@ -7,6 +7,10 @@
 .USAGE
     .\Convert-ToGen2.ps1 -VMName VM01
 
+    .\Convert-ToGen2.ps1 -VMName VM01 -WhatIf
+    Dry run: resolves the VM, host, specs, disks (with sizes) and prints
+    exactly what WOULD happen. No shutdown, no copies, no new VM, no email.
+
 .PREREQS
     - Run steps 1-6 first (checkpoint, mbr2gpt /convert inside guest, shut down)
     - VM must be powered OFF
@@ -14,6 +18,7 @@
     - Admin/WinRM rights on the Hyper-V host that owns the VM
 #>
 
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory = $true)]
     [string]$VMName
@@ -55,7 +60,12 @@ try {
     $vm = Get-SCVirtualMachine -Name $VMName -ErrorAction Stop
     if (-not $vm) { throw "VM '$VMName' not found in VMM." }
     if ($vm.Generation -eq 2) { throw "'$VMName' is already Generation 2." }
+    $doIt = $PSCmdlet.ShouldProcess($VMName, "clone to Gen2 as '$NewName'")
+
     if ($vm.VirtualMachineState -ne 'PowerOff') {
+        if (-not $doIt) {
+            Log "WOULD shut down '$VMName' (currently $($vm.VirtualMachineState)) gracefully."
+        } else {
         Log "'$VMName' is $($vm.VirtualMachineState) - shutting it down (make sure mbr2gpt /convert was already run!)..."
         Stop-SCVirtualMachine -VM $vm -Shutdown -ErrorAction Stop | Out-Null
         for ($i = 0; $i -lt 60; $i++) {
@@ -67,6 +77,7 @@ try {
             throw "'$VMName' did not shut down within 10 minutes - aborting."
         }
         Log "'$VMName' is powered off."
+        }
     }
     if (Get-SCVirtualMachine -Name $NewName) { throw "'$NewName' already exists - clean up first." }
     if ($vm.VMCheckpoints.Count -gt 0) {
@@ -92,6 +103,24 @@ try {
     if ($spec.Disks.Count -eq 0) { throw "No disks found on '$VMName'." }
     $spec.Disks | ForEach-Object { Log "Disk: $_" }
     $spec.Nics  | ForEach-Object { Log "NIC:  switch '$($_.Switch)' VLAN $(if ($_.VlanEnabled) { $_.Vlan } else { 'none' })" }
+
+    # --- Dry run: report and stop ---
+    if (-not $doIt) {
+        $sizes = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+            param($paths) $paths | ForEach-Object { [math]::Round((Get-Item $_).Length / 1GB, 1) }
+        } -ArgumentList (,$spec.Disks)
+        $newDir = Join-Path (Split-Path (Split-Path $spec.Disks[0])) $NewName
+        $free = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+            param($p) [math]::Round((Get-PSDrive ($p.Substring(0,1))).Free / 1GB, 1)
+        } -ArgumentList $newDir
+        for ($i = 0; $i -lt $spec.Disks.Count; $i++) {
+            Log "WOULD copy: $($spec.Disks[$i]) ($($sizes[$i])GB) -> $newDir\"
+        }
+        Log "WOULD create: '$NewName' Gen2, $($spec.CPU) vCPU, $($spec.MemoryMB)MB RAM, $($spec.Nics.Count) NIC(s), Secure Boot on$(if ($StartAfter) { ', then start it' })"
+        Log "Space check: needs $([math]::Round(($sizes | Measure-Object -Sum).Sum,1))GB, volume has ${free}GB free."
+        Log "DRY RUN complete - nothing was changed, no email sent."
+        exit 0
+    }
 
     # --- Build the Gen2 copy on the owning Hyper-V host ---
     Log "Building '$NewName' on $hvHost (disks are COPIED - original untouched)..."
