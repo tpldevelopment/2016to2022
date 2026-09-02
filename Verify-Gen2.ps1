@@ -58,8 +58,11 @@ try {
     $hvHost = $vm.VMHost.Name
 
     # Original for comparison (may already be decommissioned on a re-run)
-    $orig = @(Get-SCVirtualMachine -Name $VMName)
-    $orig = if ($orig.Count -eq 1) { $orig[0] } else { $null }
+    $origs = @(Get-SCVirtualMachine -Name $VMName)
+    if ($origs.Count -gt 1) {
+        Check 'Original resolves uniquely' $false "'$VMName' matches $($origs.Count) VMs - comparison unreliable"
+    }
+    $orig = if ($origs.Count -eq 1) { $origs[0] } else { $null }
 
     Check 'Generation'  ($vm.Generation -eq 2) "Gen $($vm.Generation)"
     Check 'Power state' ($vm.VirtualMachineState -eq 'Running') "$($vm.VirtualMachineState)"
@@ -80,12 +83,27 @@ try {
         $inner = Invoke-Command -VMName $name -Credential $cred -ScriptBlock {
             $ErrorActionPreference = 'Stop'
             $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop
-            $bl = 'n/a'
+            # BitLocker: volumes with protectors configured but protection OFF
+            # after conversion = protectors did not resume (a real check, not a log line)
+            $bl = 'no BitLocker tooling'
+            $blSuspended = @()
             if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
-                $bl = (Get-BitLockerVolume | ForEach-Object { "$($_.MountPoint):$($_.ProtectionStatus)" }) -join ' '
+                $vols = Get-BitLockerVolume
+                $bl = ($vols | ForEach-Object { "$($_.MountPoint):$($_.ProtectionStatus)" }) -join ' '
+                $blSuspended = @($vols | Where-Object { $_.KeyProtector.Count -gt 0 -and $_.ProtectionStatus -ne 'On' } |
+                                 ForEach-Object { $_.MountPoint })
             }
             $sb = $false; try { $sb = Confirm-SecureBootUEFI } catch { $sb = $false }
-            $dom = $false; try { $dom = Test-ComputerSecureChannel } catch { $dom = $false }
+            # Domain secure channel: only meaningful on domain MEMBERS (skip
+            # workgroup boxes and domain controllers - false failures there)
+            $cs = Get-CimInstance Win32_ComputerSystem
+            $domApplicable = $cs.PartOfDomain -and $cs.DomainRole -notin 4, 5
+            $dom = $false
+            if ($domApplicable) { try { $dom = Test-ComputerSecureChannel } catch { $dom = $false } }
+            # Event log: an unreadable log is a FAILURE, not zero errors
+            $sysErrors = -1
+            try { $sysErrors = @(Get-WinEvent -FilterHashtable @{ LogName='System'; Level=1,2; StartTime=(Get-Date).AddHours(-1) } -ErrorAction Stop).Count }
+            catch { if ($_.Exception.Message -match 'No events were found') { $sysErrors = 0 } }
             [pscustomobject]@{
                 Firmware   = (Get-ComputerInfo -Property BiosFirmwareType).BiosFirmwareType
                 SecureBoot = $sb
@@ -95,8 +113,10 @@ try {
                 GwPing     = if ($gw) { Test-Connection $gw -Count 1 -Quiet } else { $false }
                 DnsOk      = [bool](Resolve-DnsName -Name $env:USERDNSDOMAIN -ErrorAction SilentlyContinue)
                 DomainOk   = $dom
-                SysErrors  = @(Get-WinEvent -FilterHashtable @{ LogName='System'; Level=1,2; StartTime=(Get-Date).AddHours(-1) } -ErrorAction SilentlyContinue).Count
+                DomApplicable = $domApplicable
+                SysErrors  = $sysErrors
                 BitLocker  = $bl
+                BlSuspended = $blSuspended
                 StoppedAutoSvcs = (Get-Service | Where-Object {
                                       $_.StartType -eq 'Automatic' -and $_.Status -ne 'Running' -and
                                       $_.Name -notmatch 'edgeupdate|gupdate|MapsBroker|RemoteRegistry|sppsvc|TrustedInstaller|WbioSrvc|wuauserv|BITS|CDPSvc|dosvc'
@@ -111,11 +131,16 @@ try {
     Check 'Secure Boot'    ($g.G.SecureBoot) "guest reports $($g.G.SecureBoot)"
     Check 'Network'        ($g.G.GwPing) "IPs: $($g.G.IPs) | gateway ping: $($g.G.GwPing)"
     Check 'DNS resolves'   ($g.G.DnsOk) "domain lookup $(if ($g.G.DnsOk) {'ok'} else {'FAILED'})"
-    Check 'Domain channel' ($g.G.DomainOk) "secure channel $(if ($g.G.DomainOk) {'ok'} else {'broken - Test-ComputerSecureChannel -Repair'})"
-    Check 'System log clean' ($g.G.SysErrors -eq 0) "$($g.G.SysErrors) critical/error events in the last hour"
+    if ($g.G.DomApplicable) {
+        Check 'Domain channel' ($g.G.DomainOk) "secure channel $(if ($g.G.DomainOk) {'ok'} else {'broken - Test-ComputerSecureChannel -Repair'})"
+    } else {
+        Log "SKIP  Domain channel - not applicable (workgroup or domain controller)"
+    }
+    Check 'System log readable+clean' ($g.G.SysErrors -eq 0) $(if ($g.G.SysErrors -lt 0) { 'event log UNREADABLE' } else { "$($g.G.SysErrors) critical/error events in the last hour" })
+    Check 'BitLocker resumed' ($g.G.BlSuspended.Count -eq 0) $(if ($g.G.BlSuspended.Count) { "protectors configured but protection OFF on: $($g.G.BlSuspended -join ', ') - resume + verify key escrow" } else { "$($g.G.BitLocker)" })
     Check 'Auto services'  ([string]::IsNullOrEmpty($g.G.StoppedAutoSvcs)) `
         $(if ($g.G.StoppedAutoSvcs) { "NOT running: $($g.G.StoppedAutoSvcs)" } else { 'all running' })
-    Log "OS: $($g.G.OS) | BitLocker: $($g.G.BitLocker)"
+    Log "OS: $($g.G.OS)"
 
     if ($fail) {
         Log "RESULT: FAILED CHECKS on '$Target' - investigate before doing anything to '$VMName'."

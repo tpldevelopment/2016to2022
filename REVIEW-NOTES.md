@@ -31,7 +31,27 @@ Key findings and what was done:
 **Accepted risks (deliberate):** plain SMTP (site standard); no VMM JobGroup
 clone (HA VMs refused instead); VMM cloud/custom-property loss (documented).
 
-## Pass 2 — review of the reworked scripts
+## Pass 2 — review of the reworked scripts (2026-09-02)
+
+**Verdict: architecture endorsed, "do not run yet" — 11 findings (7 high).
+Two pass-1 fixes were judged incomplete (VHD conversion, BitLocker).**
+
+| # | Finding | Action taken |
+|---|---|---|
+| 1 | `Convert-VHD` ran against the ATTACHED original .vhd (unsupported) | Copy the .vhd first, convert the UNATTACHED copy, delete the temp; result validated with `Get-VHD`; temp space added to the space check |
+| 2 | BitLocker still fail-open if the module is absent | Fail-closed everywhere: missing tooling = ABORT (with `manage-bde` fallback probe); Verify now has a real "BitLocker resumed" CHECK (protectors present + protection off = FAIL) |
+| 3 | Failure message could lead operator to start original while -temp runs (duplicate server) | Catch block now queries and prints ACTUAL states of original/temp/staging + explicit "start original ONLY if others are Off" rule; same warning in success output + README |
+| 4 | Staging failure left a registered running clone; heartbeat ≠ PS ready | try/finally guarantees staging is powered off + shell removed on every path; PowerShell Direct readiness retried (12x15s) after heartbeat |
+| 5 | Duplicate destination filenames could overwrite copies | Copy plan built in preflight with guaranteed-unique names (`dN-` prefix on collision) |
+| 6 | Target folder could nest inside the original VM folder | Target now derives from the VM's own config folder (host `Get-VM .Path`) → true sibling; ancestor/descendant assertions added |
+| 7 | Runbook deleted rollback before backing up the new VM | README order fixed: rename → re-validate → backup new + verify → retain old through rollback window → delete last |
+| 8 | -WhatIf silently skipped guest checks when VM off | Preflight now reports "PASSED WITH GAPS" + dry run states what was NOT tested |
+| 9 | Host-level name/switch collisions found too late; VMM refresh unverified | Preflight now checks host `Get-VM` for temp/staging names + `Get-VMSwitch` for every NIC switch; post-refresh VMM presence verified |
+| 10 | VHD forced to Dynamic; loss list understated | `-VHDType` override removed (source type preserved); loss list expanded (CPU limits/weights, memory buffer/priority, auto start/stop, NIC offloads, controller layout) |
+| 11 | Verify could false-pass (silent event log) and false-fail (DCs/workgroup on secure channel) | Event log unreadable = FAIL; secure-channel check skipped on non-members and DCs; ambiguous original name = explicit FAIL, not silent skip |
+| 12 | Wrong mbr2gpt log filename in guidance | Corrected to `%windir%\setupact.log` / `setuperr.log` |
+
+## Pass 3 — final review
 
 _(pending)_
 

@@ -71,7 +71,13 @@ are never modified — they are the rollback.
 | 3 | Admin box | `.\Convert-ToGen2.ps1 -VMName VM01` — shuts down original, copies disks (VHD→VHDX), converts the COPY in an isolated staging VM (mbr2gpt, no reboot), builds `VM01-temp` as Gen2, starts it, emails report |
 | 4 | Admin box | `.\Verify-Gen2.ps1 -VMName VM01` — basic boot/config checks on `VM01-temp` vs the original |
 | 5 | You | Validate the application/workload. This is not scriptable. |
-| 6 | VMM GUI | Rename `VM01`→`VM01-old`, `VM01-temp`→`VM01`; delete `VM01-old` (removes its disks); backup the new VM01 |
+| 6 | VMM GUI | Rename `VM01`→`VM01-old` and `VM01-temp`→`VM01`. **Keep VM01-old (off).** |
+| 7 | You | Re-validate after the rename, **back up the new VM01, verify the backup ran clean** |
+| 8 | You | Retain `VM01-old` through your agreed rollback window (days, not minutes) |
+| 9 | VMM GUI | Only then: delete `VM01-old` (removes its disks) |
+
+**Never run VM01 and VM01-temp/VM01-old at the same time** — same hostname, IP,
+and (static) MAC. Rollback = confirm the new VM is OFF, then start the old one.
 
 **Disk state at every handoff:** original disks stay MBR and untouched through
 all steps; only the copies in `...\VM01-temp\` are ever converted to GPT.
