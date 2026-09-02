@@ -84,15 +84,17 @@ try {
             if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
                 $bl = (Get-BitLockerVolume | ForEach-Object { "$($_.MountPoint):$($_.ProtectionStatus)" }) -join ' '
             }
+            $sb = $false; try { $sb = Confirm-SecureBootUEFI } catch { $sb = $false }
+            $dom = $false; try { $dom = Test-ComputerSecureChannel } catch { $dom = $false }
             [pscustomobject]@{
                 Firmware   = (Get-ComputerInfo -Property BiosFirmwareType).BiosFirmwareType
-                SecureBoot = try { Confirm-SecureBootUEFI } catch { $false }
+                SecureBoot = $sb
                 OS         = (Get-CimInstance Win32_OperatingSystem).Caption
                 IPs        = (Get-NetIPAddress -AddressFamily IPv4 |
                               Where-Object { $_.IPAddress -notlike '169.254*' -and $_.IPAddress -ne '127.0.0.1' }).IPAddress -join ', '
                 GwPing     = if ($gw) { Test-Connection $gw -Count 1 -Quiet } else { $false }
                 DnsOk      = [bool](Resolve-DnsName -Name $env:USERDNSDOMAIN -ErrorAction SilentlyContinue)
-                DomainOk   = try { Test-ComputerSecureChannel } catch { $false }
+                DomainOk   = $dom
                 SysErrors  = @(Get-WinEvent -FilterHashtable @{ LogName='System'; Level=1,2; StartTime=(Get-Date).AddHours(-1) } -ErrorAction SilentlyContinue).Count
                 BitLocker  = $bl
                 StoppedAutoSvcs = (Get-Service | Where-Object {
