@@ -99,20 +99,27 @@ try {
         param($s)
         $out = New-Object System.Collections.Generic.List[string]
 
-        # Copy every disk next to the original with a -temp suffix
+        # New VM gets its own folder next to the original's:
+        #   D:\VMs\VM01\VM01.vhdx  ->  D:\VMs\VM01-temp\VM01.vhdx
+        $parentDir = Split-Path (Split-Path $s.Disks[0])
+        $newDir    = Join-Path $parentDir $s.Name
+        if (Test-Path $newDir) { throw "Target folder already exists: $newDir" }
+        New-Item -Path $newDir -ItemType Directory | Out-Null
+        $out.Add("New VM folder: $newDir")
+
         $newDisks = foreach ($d in $s.Disks) {
-            $dir  = Split-Path $d
-            $base = [IO.Path]::GetFileNameWithoutExtension($d)
-            $ext  = [IO.Path]::GetExtension($d)
-            $copy = Join-Path $dir "$base-temp$ext"
-            if (Test-Path $copy) { throw "Disk copy target already exists: $copy" }
+            $copy = Join-Path $newDir (Split-Path $d -Leaf)
+            if (Test-Path $copy) {   # two disks with the same filename from different folders
+                $copy = Join-Path $newDir ("{0}-{1}" -f (Get-Random), (Split-Path $d -Leaf))
+            }
             $out.Add("Copying $d -> $copy")
             Copy-Item $d $copy
             $copy
         }
 
-        # Gen2 VM, OS disk = first copied disk
-        $vm = New-VM -Name $s.Name -Generation 2 -MemoryStartupBytes ([int64]$s.MemoryMB * 1MB) -VHDPath $newDisks[0]
+        # Gen2 VM, config stored in the same folder, OS disk = first copied disk
+        $vm = New-VM -Name $s.Name -Generation 2 -Path $parentDir `
+                     -MemoryStartupBytes ([int64]$s.MemoryMB * 1MB) -VHDPath $newDisks[0]
         Set-VMProcessor -VMName $s.Name -Count $s.CPU
         if ($s.DynMem) {
             Set-VMMemory -VMName $s.Name -DynamicMemoryEnabled $true `
