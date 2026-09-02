@@ -570,7 +570,10 @@ try {
             Name = $hwName; Generation = 2
             CPUCount = $vm.CPUCount; MemoryMB = $vm.Memory
             SecureBootEnabled = $true; SecureBootTemplate = 'MicrosoftWindows'
-            FirstBootDevice = 'SCSI,0,0'      # deterministic Gen2 firmware boot entry
+            # NOTE: FirstBootDevice must NOT be set on the profile - the profile
+            # has no disks (they arrive via the JobGroup) and VMM fails creation
+            # with error 23352 "not valid for a boot device" (proven in pilot).
+            # It is set on the VM right after creation instead.
         }
         if ($vm.DynamicMemoryEnabled) {
             $hwArgs['DynamicMemoryEnabled'] = $true
@@ -609,6 +612,8 @@ try {
             -UseLocalVirtualHardDisk -HighlyAvailable $vm.IsHighlyAvailable -ErrorAction Stop
         if (-not $newVm) { throw "New-SCVirtualMachine returned nothing - check the VMM job log." }
         $newVmCreated = $true
+        # Deterministic Gen2 firmware boot entry - now that the disks exist
+        Set-SCVirtualMachine -VM $newVm -FirstBootDevice 'SCSI,0,0' -ErrorAction Stop | Out-Null
     }
     finally {
         if ($hwProfile) { Remove-SCHardwareProfile -HardwareProfile $hwProfile -ErrorAction SilentlyContinue | Out-Null }
