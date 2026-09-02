@@ -9,10 +9,9 @@
       1. Graceful shutdown of the original VM
       2. Copy disks to <VM parent folder>\<name>-temp\
          (.vhd sources: copy first, then convert the UNATTACHED copy to VHDX)
-      3. Isolated Gen1 staging VM (no NIC) boots the COPIED boot disk;
-         BitLocker suspended (fail-closed) + mbr2gpt validate/convert inside;
-         staging then SHUTS DOWN (never rebooted - BIOS cannot boot GPT).
-         Staging shell is ALWAYS powered off and removed, even on failure.
+      3. The COPIED boot disk is mounted ON THE HOST and converted there
+         with mbr2gpt /disk:<n> - no staging VM, no guest login needed.
+         Result verified GPT, then dismounted.
       4. Gen2 VM <name>-temp built on the converted copies; Secure Boot on
       5. Start (optional), VMM refresh + presence check, email report
 
@@ -27,8 +26,8 @@
 .PREREQS
     - A verified manual backup of the VM (always, first)
     - SCVMM console module on this box; WinRM/admin to the owning Hyper-V host
-    - Guest OS 64-bit with mbr2gpt.exe (Server 2019+/Win10+)
-    - NOT for clustered/HA VMs (refused; use the HA-aware manual path)
+    - Guest OS 64-bit (probed when running); HOST needs mbr2gpt.exe (2019+)
+    - HA VMs supported (created highly available via VMM); HA path untested
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -65,7 +64,7 @@ function Send-Report($subject) {
     } catch { Write-Warning "Email failed: $_" }
 }
 
-# One prompt: your own password. Used for PowerShell Direct into the guest/staging VM.
+# One prompt: your own password. Used only for the preflight probe into the RUNNING guest (network up, domain auth works there).
 $guestCred = Get-Credential -UserName "$env:USERDOMAIN\$env:USERNAME" -Message "Password for $env:USERDOMAIN\$env:USERNAME"
 
 $hvHost = $null
@@ -307,107 +306,53 @@ try {
     Log "Copy complete + validated. Boot disk copy: $bootCopy"
 
     # =========================================================================
-    # PHASE 3 - STAGING (isolated). Shell is ALWAYS stopped+removed via finally.
+    # PHASE 3 - CONVERT THE COPY FROM THE HOST (no staging boot, no guest auth)
+    # Mount the copied boot VHDX on the Hyper-V host, run mbr2gpt against that
+    # disk number, dismount. The original VM's disks are never mounted.
     # =========================================================================
-    $phase = 'staging'
-    Log "Creating isolated staging VM '$StagingName' (no network)..."
-    $stageResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
-        param($sName, $bootDisk, $dir, $cred)
+    $phase = 'convert'
+    Log "Mounting boot-disk copy on $hvHost and converting with mbr2gpt (no staging VM needed)..."
+    $convResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+        param($bootDisk)
         $ErrorActionPreference = 'Stop'
         $out = New-Object System.Collections.Generic.List[string]
+        $mounted = $false
         try {
-            New-VM -Name $sName -Generation 1 -Path $dir -MemoryStartupBytes 4GB -VHDPath $bootDisk | Out-Null
-            Get-VMNetworkAdapter -VMName $sName | Remove-VMNetworkAdapter
-            Start-VM -Name $sName
-            $out.Add('Staging VM started (isolated).')
+            $disk = Mount-VHD -Path $bootDisk -Passthru | Get-Disk
+            $mounted = $true
+            $out.Add("Mounted $bootDisk as host disk #$($disk.Number) ($([math]::Round($disk.Size/1GB,1))GB, $($disk.PartitionStyle)).")
+            if ($disk.PartitionStyle -eq 'GPT') { throw "Copy is already GPT - unexpected; inspect manually." }
 
-            # Heartbeat, then PowerShell Direct READINESS (heartbeat alone
-            # does not mean PS is available in the guest) - retried.
-            $up = $false
-            for ($j = 0; $j -lt 60; $j++) {
-                Start-Sleep -Seconds 10
-                if ("$((Get-VM -Name $sName).Heartbeat)" -like 'Ok*') { $up = $true; break }
-            }
-            if (-not $up) { throw "Staging VM never reached a healthy heartbeat (10 min) - copied disk may not boot." }
-            $ready = $false
-            for ($j = 0; $j -lt 12; $j++) {
-                try {
-                    Invoke-Command -VMName $sName -Credential $cred -ScriptBlock { 'ready' } -ErrorAction Stop | Out-Null
-                    $ready = $true; break
-                } catch {
-                    # Bad credentials are a hard stop - retrying them risks account lockout
-                    if ($_.Exception.Message -match 'credential|password|logon failure|authentication|access is denied') {
-                        throw "PowerShell Direct rejected the supplied credentials: $($_.Exception.Message)"
-                    }
-                    Start-Sleep -Seconds 15
-                }
-            }
-            if (-not $ready) { throw "PowerShell Direct never became ready in staging (3 min after heartbeat) - check guest credentials." }
-            $out.Add('Staging heartbeat + PowerShell Direct ready - converting.')
+            $v = & "$env:windir\System32\mbr2gpt.exe" /validate /disk:$($disk.Number) /allowFullOS 2>&1
+            $out.Add("validate: $($v -join ' | ')")
+            if ($LASTEXITCODE -ne 0) { throw "mbr2gpt VALIDATE failed (exit $LASTEXITCODE) on the mounted copy. Copy unchanged; original VM intact. See %windir%\setupact.log on the HOST." }
 
-            $conv = Invoke-Command -VMName $sName -Credential $cred -ScriptBlock {
-                $ErrorActionPreference = 'Stop'
-                $r = New-Object System.Collections.Generic.List[string]
-                # BitLocker fail-closed, all volumes
-                if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
-                    foreach ($v in Get-BitLockerVolume) {
-                        if ($v.ProtectionStatus -notin 'On', 'Off') { throw "BitLocker state on $($v.MountPoint) is '$($v.ProtectionStatus)' (unknown) - refusing to convert blind." }
-                        if ($v.ProtectionStatus -eq 'On') {
-                            Suspend-BitLocker -MountPoint $v.MountPoint | Out-Null
-                            if ((Get-BitLockerVolume -MountPoint $v.MountPoint).ProtectionStatus -eq 'On') { throw "BitLocker suspension FAILED on $($v.MountPoint)." }
-                            $r.Add("BitLocker suspended on $($v.MountPoint).")
-                        }
-                    }
-                } elseif (Test-Path "$env:windir\System32\manage-bde.exe") {
-                    $raw = & "$env:windir\System32\manage-bde.exe" -status 2>&1 | Out-String
-                    if ($LASTEXITCODE -ne 0) { throw 'Cannot determine BitLocker state in staging - refusing to convert blind.' }
-                    if ($raw -match 'Protection Status:\s*Protection On') { throw 'BitLocker ON but Get-BitLockerVolume unavailable to suspend it - handle manually.' }
-                } elseif ((Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) -and
-                          -not (Get-WindowsFeature -Name BitLocker).Installed) {
-                    $r.Add('BitLocker feature not installed - cannot be active; proceeding.')
-                } else {
-                    throw 'Cannot determine BitLocker state in staging (no tooling) - refusing to convert blind.'
-                }
-                if (-not (Test-Path "$env:windir\System32\mbr2gpt.exe")) { throw 'mbr2gpt.exe not found in guest - OS too old.' }
-                $v = & "$env:windir\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
-                $r.Add("validate: $($v -join ' | ')")
-                if ($LASTEXITCODE -ne 0) { throw "mbr2gpt VALIDATE failed (exit $LASTEXITCODE). Copied disk unchanged." }
-                $c = & "$env:windir\System32\mbr2gpt.exe" /convert /allowFullOS 2>&1
-                $r.Add("convert: $($c -join ' | ')")
-                if ($LASTEXITCODE -eq 100) { throw 'mbr2gpt exit 100: disk converted to GPT but BCD restore FAILED - copy is converted-but-unbootable. See %windir%\setupact.log / setuperr.log in staging.' }
-                if ($LASTEXITCODE -ne 0) { throw "mbr2gpt CONVERT failed (exit $LASTEXITCODE). See %windir%\setupact.log / setuperr.log in the staging guest." }
-                $r.Add('Conversion complete (disk is GPT; firmware switch happens via the Gen2 VM).')
-                $r
-            }
-            $conv | ForEach-Object { $out.Add($_) }
+            $c = & "$env:windir\System32\mbr2gpt.exe" /convert /disk:$($disk.Number) /allowFullOS 2>&1
+            $out.Add("convert: $($c -join ' | ')")
+            if ($LASTEXITCODE -eq 100) { throw 'mbr2gpt exit 100: copy converted to GPT but BCD restore FAILED - converted-but-unbootable. Delete the copies and rerun. Original VM intact.' }
+            if ($LASTEXITCODE -ne 0) { throw "mbr2gpt CONVERT failed (exit $LASTEXITCODE) on the mounted copy. See %windir%\setupact.log / setuperr.log on the HOST. Original VM intact." }
 
-            Stop-VM -Name $sName -Force
-            for ($j = 0; $j -lt 30 -and (Get-VM -Name $sName).State -ne 'Off'; $j++) { Start-Sleep -Seconds 5 }
-            if ((Get-VM -Name $sName).State -ne 'Off') { throw 'Staging VM did not power off.' }
-            $out.Add('Staging shut down cleanly.')
+            Dismount-VHD -Path $bootDisk
+            $mounted = $false
+            # Post-check: confirm the copy is now GPT
+            $check = Mount-VHD -Path $bootDisk -ReadOnly -Passthru | Get-Disk
+            $mounted = $true
+            $style = $check.PartitionStyle
+            Dismount-VHD -Path $bootDisk
+            $mounted = $false
+            if ($style -ne 'GPT') { throw "Post-convert check: mounted copy reports '$style', expected GPT." }
+            $out.Add('Conversion complete and verified GPT (firmware switch happens via the Gen2 VM).')
         }
         finally {
-            # Best-effort staging cleanup; the caller VERIFIES the result.
-            $s = Get-VM -Name $sName -ErrorAction SilentlyContinue
-            if ($s) {
-                if ($s.State -ne 'Off') { Stop-VM -Name $sName -TurnOff -Force -ErrorAction SilentlyContinue }
-                Remove-VM -Name $sName -Force -ErrorAction SilentlyContinue   # shell only; disks stay for diagnosis
-                $s2 = Get-VM -Name $sName -ErrorAction SilentlyContinue
-                if ($s2) { $out.Add("STAGING CLEANUP INCOMPLETE: '$sName' still registered, state $($s2.State) - manual cleanup required.") }
-                else     { $out.Add('Staging shell removed (best-effort cleanup verified).') }
-            }
+            if ($mounted) { Dismount-VHD -Path $bootDisk -ErrorAction SilentlyContinue }
         }
         $out
-    } -ArgumentList $StagingName, $bootCopy, $newDir, $guestCred
-    $stageResult | ForEach-Object { Log $_ }
+    } -ArgumentList $bootCopy
+    $convResult | ForEach-Object { Log $_ }
 
-    # Independent verification: never build the Gen2 VM while a staging shell exists
-    $residual = Invoke-Command -ComputerName $hvHost -ScriptBlock {
-        param($n)
-        $s = Get-VM -Name $n -ErrorAction SilentlyContinue
-        if ($s) { "$($s.State)" } else { $null }
-    } -ArgumentList $StagingName
-    if ($residual) { throw "Staging VM '$StagingName' still exists on the host (state: $residual) after cleanup - remove it manually before rerunning." }
+    # (Old staging-VM path removed: PowerShell Direct into an isolated clone
+    # cannot authenticate domain accounts - no DC reachable, and cached
+    # credentials do not apply to that logon type. Host-mount needs no auth.)
 
     # =========================================================================
     # PHASE 4 - BUILD THE GEN2 VM
