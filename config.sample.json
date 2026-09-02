@@ -1,0 +1,8 @@
+{
+  "VMMServer": "SCVMM01.yourdomain.local",
+  "SmtpServer": "smtp.yourdomain.local",
+  "SmtpPort": 25,
+  "MailFrom": "hyperv-automation@yourdomain.local",
+  "MailTo": ["you@yourdomain.local"],
+  "StartAfter": true
+}

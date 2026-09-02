@@ -16,13 +16,20 @@ param(
     [string]$VMName
 )
 
-# ==================== EDIT THESE ====================
-$VMMServer  = 'SCVMM01.yourdomain.local'
-$SmtpServer = 'smtp.yourdomain.local'
-$SmtpPort   = 25
-$MailFrom   = 'hyperv-automation@yourdomain.local'
-$MailTo     = @('you@yourdomain.local')
-# ====================================================
+# ============ CONFIG (config.json) ============
+# Looked up next to the script, then ONE FOLDER UP (e.g. C:\adminScripts\config.json
+# survives re-downloading the repo). Copy config.sample.json there and edit once.
+$cfgPath = @((Join-Path $PSScriptRoot 'config.json'),
+             (Join-Path (Split-Path $PSScriptRoot) 'config.json')) |
+           Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $cfgPath) { throw "config.json not found next to the script or one folder up. Copy config.sample.json to e.g. C:\adminScripts\config.json and edit it." }
+$cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+$VMMServer  = $cfg.VMMServer
+$SmtpServer = $cfg.SmtpServer
+$SmtpPort   = [int]$cfg.SmtpPort
+$MailFrom   = $cfg.MailFrom
+$MailTo     = @($cfg.MailTo)
+# ==============================================
 
 $ErrorActionPreference = 'Stop'
 $Target = "$VMName-temp"

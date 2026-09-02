@@ -36,14 +36,21 @@ param(
     [string]$VMName
 )
 
-# ==================== EDIT THESE ====================
-$VMMServer  = 'SCVMM01.yourdomain.local'          # SCVMM management server
-$SmtpServer = 'smtp.yourdomain.local'             # non-secure relay (site standard)
-$SmtpPort   = 25
-$MailFrom   = 'hyperv-automation@yourdomain.local'
-$MailTo     = @('you@yourdomain.local')
-$StartAfter = $true                               # start the -temp VM when built
-# ====================================================
+# ============ CONFIG (config.json) ============
+# Looked up next to the script, then ONE FOLDER UP (e.g. C:\adminScripts\config.json
+# survives re-downloading the repo). Copy config.sample.json there and edit once.
+$cfgPath = @((Join-Path $PSScriptRoot 'config.json'),
+             (Join-Path (Split-Path $PSScriptRoot) 'config.json')) |
+           Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $cfgPath) { throw "config.json not found next to the script or one folder up. Copy config.sample.json to e.g. C:\adminScripts\config.json and edit it." }
+$cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
+$VMMServer  = $cfg.VMMServer
+$SmtpServer = $cfg.SmtpServer
+$SmtpPort   = [int]$cfg.SmtpPort
+$MailFrom   = $cfg.MailFrom
+$MailTo     = @($cfg.MailTo)
+$StartAfter = [bool]$cfg.StartAfter
+# ==============================================
 
 $ErrorActionPreference = 'Stop'
 $NewName     = "$VMName-temp"
