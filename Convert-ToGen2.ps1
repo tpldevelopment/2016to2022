@@ -320,7 +320,14 @@ try {
         try {
             $disk = Mount-VHD -Path $bootDisk -Passthru | Get-Disk
             $mounted = $true
-            $out.Add("Mounted $bootDisk as host disk #$($disk.Number) ($([math]::Round($disk.Size/1GB,1))GB, $($disk.PartitionStyle)).")
+            # Host SAN policy typically brings newly-mounted disks up OFFLINE -
+            # mbr2gpt then cannot see the volumes ("Cannot find OS partition(s)")
+            if ($disk.IsOffline)  { Set-Disk -Number $disk.Number -IsOffline $false }
+            if ($disk.IsReadOnly) { Set-Disk -Number $disk.Number -IsReadOnly $false }
+            Start-Sleep -Seconds 5      # let volumes arrive
+            $disk = Get-Disk -Number $disk.Number
+            $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
+            $out.Add("Mounted $bootDisk as host disk #$($disk.Number) ($([math]::Round($disk.Size/1GB,1))GB, $($disk.PartitionStyle), offline=$($disk.IsOffline)). Partitions: $(($parts | ForEach-Object { "$($_.PartitionNumber):$($_.Type)/$([math]::Round($_.Size/1GB,1))GB" }) -join ', ')")
             if ($disk.PartitionStyle -eq 'GPT') { throw "Copy is already GPT - unexpected; inspect manually." }
 
             $v = & "$env:windir\System32\mbr2gpt.exe" /validate /disk:$($disk.Number) /allowFullOS 2>&1
