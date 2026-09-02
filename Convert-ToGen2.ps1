@@ -35,7 +35,9 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$VMName
+    [string]$VMName,
+    [switch]$InPlace,          # convert the ORIGINAL disk in the running guest (fast path; requires -BackupVerified)
+    [switch]$BackupVerified    # operator attests a verified backup exists (required with -InPlace)
 )
 
 # ============ CONFIG (config.json) ============
@@ -97,6 +99,10 @@ try {
     Log "Resolved: '$VMName' ID $($vm.ID) on host $hvHost | Gen $($vm.Generation) | $($vm.VirtualMachineState) | vCPU $($vm.CPUCount) | RAM $($vm.Memory)MB"
 
     if ($vm.Generation -eq 2) { throw "'$VMName' is already Generation 2." }
+    if ($InPlace) {
+        if (-not $BackupVerified) { throw '-InPlace converts the ORIGINAL disk (irreversible). Rerun with -BackupVerified to attest a verified backup exists.' }
+        if ($vm.VirtualMachineState -ne 'Running') { throw "-InPlace needs '$VMName' RUNNING (conversion happens inside the guest over PowerShell Direct). Start it and rerun." }
+    }
     if ($vm.IsHighlyAvailable) { Log "'$VMName' is HA/clustered - the new VM will be created through VMM as highly available. Pilot on non-HA first; HA path is untested." }
     if (Get-SCVirtualMachine -Name $NewName)     { throw "'$NewName' already exists in VMM - clean up first." }
     if (Get-SCVirtualMachine -Name $StagingName) { throw "'$StagingName' already exists in VMM - clean up first." }
@@ -122,14 +128,14 @@ try {
     # (target derives from the VM folder, not disk paths - disks may live in
     # a "Virtual Hard Disks" subfolder).
     $hp = Invoke-Command -ComputerName $hvHost -ScriptBlock {
-        param($name, $tempName, $stagingName, $switches, $isoPath)
+        param($name, $tempName, $stagingName, $switches, $isoPath, $inPlaceMode)
         $ErrorActionPreference = 'Stop'
         foreach ($n in @($tempName, $stagingName)) {
             if (Get-VM -Name $n -ErrorAction SilentlyContinue) { throw "Host-level VM '$n' already exists on this host (may not be in VMM)." }
         }
         $missing = @($switches | Where-Object { -not (Get-VMSwitch -Name $_ -ErrorAction SilentlyContinue) })
         if ($missing) { throw "vSwitch(es) not found on host: $($missing -join ', ')" }
-        if (-not $isoPath -or -not (Test-Path $isoPath)) { throw "PE conversion ISO not found from the host at '$isoPath'. Build it once with Build-Gen2PeIso.ps1, copy it where hosts can read it, set PeIsoPath in config.json." }
+        if (-not $inPlaceMode -and (-not $isoPath -or -not (Test-Path $isoPath))) { throw "PE conversion ISO not found from the host at '$isoPath'. Build it once with Build-Gen2PeIso.ps1 and set PeIsoPath in config.json - or use -InPlace." }
         $hostVm = Get-VM -Name $name
         $disks = foreach ($d in (Get-VMHardDiskDrive -VMName $name)) {
             $vhd = Get-VHD -Path $d.Path
@@ -144,7 +150,7 @@ try {
             }
         }
         [pscustomobject]@{ VMPath = $hostVm.Path; Disks = $disks }
-    } -ArgumentList $VMName, $NewName, $StagingName, @($nicSpec | Where-Object { -not $_.VMNetwork -and $_.Switch } | ForEach-Object { $_.Switch } | Select-Object -Unique), $PeIsoPath
+    } -ArgumentList $VMName, $NewName, $StagingName, @($nicSpec | Where-Object { -not $_.VMNetwork -and $_.Switch } | ForEach-Object { $_.Switch } | Select-Object -Unique), $PeIsoPath, [bool]$InPlace
 
     # VMM-side network object resolution (fail in preflight, not at build
     # time; require EXACTLY one match - ambiguous names are unsafe)
@@ -164,6 +170,9 @@ try {
     $diskInfo | ForEach-Object { Log "Disk: $($_.Controller) $($_.Path) [$($_.Format)/$($_.VhdType), $($_.FileSizeGB)GB$(if ($_.IsBoot) { ', BOOT' })]" }
     $boot = @($diskInfo | Where-Object IsBoot)
     if ($boot.Count -ne 1) { throw "Expected exactly one boot disk at IDE 0:0, found $($boot.Count). Nonstandard layout - handle manually." }
+    if ($InPlace -and @($diskInfo | Where-Object Format -eq 'VHD').Count -gt 0) {
+        throw '-InPlace cannot be used with legacy .vhd disks (Gen2 requires VHDX and in-place does not convert formats). Use the default staging mode for this VM.'
+    }
     $chained = @($diskInfo | Where-Object { $_.ParentPath })
     if ($chained.Count -gt 0) { throw "Differencing/checkpoint chain detected on: $(($chained.Path) -join ', '). Merge chains first." }
 
@@ -317,74 +326,133 @@ try {
     Log "Copy complete + validated. Boot disk copy: $bootCopy"
 
     # =========================================================================
-    # PHASE 3 - CONVERT THE COPY FROM THE HOST (no staging boot, no guest auth)
-    # Mount the copied boot VHDX on the Hyper-V host, run mbr2gpt against that
-    # disk number, dismount. The original VM's disks are never mounted.
+    # PHASE 3 - CONVERT (two modes)
+    #  -InPlace: mbr2gpt inside the RUNNING guest on its own system disk
+    #            (supported full-OS mode; domain auth works - VM has network),
+    #            then SHUT DOWN (never reboot: BIOS cannot boot the GPT result).
+    #            The -temp copies remain as a pristine MBR fallback.
+    #  default:  isolated staging VM boots the PE ISO against the COPY.
     # =========================================================================
-    $phase = 'convert'
-    Log "rev pe-staging-a | Booting PE staging VM '$StagingName' from the conversion ISO (no credentials, no host changes)..."
-    $convResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
-        param($sName, $bootDisk, $dir, $iso)
-        $ErrorActionPreference = 'Stop'
-        $out = New-Object System.Collections.Generic.List[string]
-        $ok = $false; $fail = $null
-        try {
-            New-VM -Name $sName -Generation 1 -Path $dir -MemoryStartupBytes 2GB -VHDPath $bootDisk | Out-Null
-            Get-VMNetworkAdapter -VMName $sName | Remove-VMNetworkAdapter      # fully isolated
-            Set-VMDvdDrive -VMName $sName -Path $iso
-            Set-VMBios -VMName $sName -StartupOrder @('CD','IDE','LegacyNetworkAdapter','Floppy')
-            Start-VM -Name $sName
-            $out.Add('PE staging booted (isolated, DVD-first). It runs mbr2gpt on its only disk and powers itself off.')
-            $done = $false
-            for ($j = 0; $j -lt 150; $j++) {
-                Start-Sleep -Seconds 10
-                if ((Get-VM -Name $sName).State -eq 'Off') { $done = $true; break }
+    if ($InPlace) {
+        $phase = 'convert-inplace'
+        Log "rev inplace-a | Converting the ORIGINAL system disk inside the running guest (backup attested; MBR fallback copy kept in $newDir)..."
+        $ipResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+            param($name, $cred)
+            $ErrorActionPreference = 'Stop'
+            Invoke-Command -VMName $name -Credential $cred -ScriptBlock {
+                $ErrorActionPreference = 'Stop'
+                $r = New-Object System.Collections.Generic.List[string]
+                if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+                    foreach ($v in Get-BitLockerVolume) {
+                        if ($v.ProtectionStatus -notin 'On', 'Off') { throw "BitLocker state on $($v.MountPoint) is '$($v.ProtectionStatus)' (unknown) - refusing." }
+                        if ($v.ProtectionStatus -eq 'On') {
+                            Suspend-BitLocker -MountPoint $v.MountPoint | Out-Null
+                            if ((Get-BitLockerVolume -MountPoint $v.MountPoint).ProtectionStatus -eq 'On') { throw "BitLocker suspension FAILED on $($v.MountPoint)." }
+                            $r.Add("BitLocker suspended on $($v.MountPoint).")
+                        }
+                    }
+                }
+                $v = cmd.exe /c "$env:windir\System32\mbr2gpt.exe /validate /allowFullOS 2>&1"
+                $r.Add("validate (exit $LASTEXITCODE): $(($v | Where-Object { $_ }) -join ' | ')")
+                if ($LASTEXITCODE -ne 0) { throw "mbr2gpt VALIDATE failed (exit $LASTEXITCODE) - disk NOT converted, VM unharmed. See %windir%\setupact.log in the guest." }
+                $c = cmd.exe /c "$env:windir\System32\mbr2gpt.exe /convert /allowFullOS 2>&1"
+                $r.Add("convert (exit $LASTEXITCODE): $(($c | Where-Object { $_ }) -join ' | ')")
+                if ($LASTEXITCODE -eq 100) { throw 'mbr2gpt exit 100: disk IS GPT but BCD restore failed - converted-but-unbootable. RESTORE FROM BACKUP or swap in the MBR copy from the -temp folder.' }
+                if ($LASTEXITCODE -ne 0) { throw "mbr2gpt CONVERT failed (exit $LASTEXITCODE). Disk state uncertain - verify before booting; fallbacks: backup / -temp MBR copy." }
+                $r.Add('Conversion complete. Shutting down - this VM must NEVER boot as Gen1 again.')
+                $r
             }
-            if (-not $done) { throw 'PE staging did not power off within 25 min - check its console, then remove it.' }
-            $out.Add("PE staging finished and powered off after ~$(($j + 1) * 10)s.")
-        }
-        catch { $fail = "$_" }
-        finally {
-            $st = Get-VM -Name $sName -ErrorAction SilentlyContinue
-            if ($st) {
-                if ($st.State -ne 'Off') { Stop-VM -Name $sName -TurnOff -Force -ErrorAction SilentlyContinue }
-                Remove-VM -Name $sName -Force -ErrorAction SilentlyContinue
-                if (Get-VM -Name $sName -ErrorAction SilentlyContinue) { $out.Add("STAGING CLEANUP INCOMPLETE: remove '$sName' manually.") }
-                else { $out.Add('Staging shell removed (verified).') }
-            }
-        }
-        if (-not $fail) {
-            # Verify the copy is now GPT; pull the PE log off the disk for the report
-            $mounted = $false
+        } -ArgumentList $VMName, $guestCred
+        $ipResult | ForEach-Object { Log $_ }
+
+        Stop-SCVirtualMachine -VM (Get-SCVirtualMachine -Name $VMName) -Shutdown -ErrorAction Stop | Out-Null
+        $vm = Get-SCVirtualMachine -Name $VMName
+        for ($j = 0; $j -lt 60 -and $vm.VirtualMachineState -ne 'PowerOff'; $j++) { Start-Sleep -Seconds 10; $vm = Get-SCVirtualMachine -Name $VMName }
+        if ($vm.VirtualMachineState -ne 'PowerOff') { throw "'$VMName' did not shut down after conversion - DO NOT let it reboot as Gen1. Force it off, then rerun/inspect." }
+        Log "'$VMName' shut down post-conversion."
+
+        # Detach the (now GPT) disks from the Gen1 shell so VMM can give them
+        # to the Gen2 VM. Files are NOT deleted. Rollback commands are logged.
+        Invoke-Command -ComputerName $hvHost -ScriptBlock {
+            param($name)
+            $ErrorActionPreference = 'Stop'
+            Get-VMHardDiskDrive -VMName $name | Remove-VMHardDiskDrive
+        } -ArgumentList $VMName
+        Get-SCVMHost -ComputerName $hvHost | Read-SCVMHost | Out-Null
+        Log "Disks detached from the Gen1 shell (files untouched). Rollback if needed: restore backup, or re-attach with Add-VMHardDiskDrive -VMName '$VMName' -ControllerType IDE -ControllerNumber 0 -ControllerLocation 0 -Path '$($boot[0].Path)' (repeat per data disk) - but ONLY with an MBR disk (backup/-temp copy), the original is GPT now."
+    }
+    else {
+        # =========================================================================
+        # PHASE 3 - CONVERT THE COPY FROM THE HOST (no staging boot, no guest auth)
+        # Mount the copied boot VHDX on the Hyper-V host, run mbr2gpt against that
+        # disk number, dismount. The original VM's disks are never mounted.
+        # =========================================================================
+        $phase = 'convert'
+        Log "rev pe-staging-a | Booting PE staging VM '$StagingName' from the conversion ISO (no credentials, no host changes)..."
+        $convResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+            param($sName, $bootDisk, $dir, $iso)
+            $ErrorActionPreference = 'Stop'
+            $out = New-Object System.Collections.Generic.List[string]
+            $ok = $false; $fail = $null
             try {
-                $disk = Mount-VHD -Path $bootDisk -ReadOnly -Passthru | Get-Disk
-                $mounted = $true
-                $style = $disk.PartitionStyle
-                $peLog = $null
-                $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
-                foreach ($p in ($parts | Where-Object { -not $_.DriveLetter -and $_.Type -match 'IFS|Basic' })) {
-                    try { $p | Add-PartitionAccessPath -AssignDriveLetter | Out-Null } catch {}
+                New-VM -Name $sName -Generation 1 -Path $dir -MemoryStartupBytes 2GB -VHDPath $bootDisk | Out-Null
+                Get-VMNetworkAdapter -VMName $sName | Remove-VMNetworkAdapter      # fully isolated
+                Set-VMDvdDrive -VMName $sName -Path $iso
+                Set-VMBios -VMName $sName -StartupOrder @('CD','IDE','LegacyNetworkAdapter','Floppy')
+                Start-VM -Name $sName
+                $out.Add('PE staging booted (isolated, DVD-first). It runs mbr2gpt on its only disk and powers itself off.')
+                $done = $false
+                for ($j = 0; $j -lt 150; $j++) {
+                    Start-Sleep -Seconds 10
+                    if ((Get-VM -Name $sName).State -eq 'Off') { $done = $true; break }
                 }
-                Start-Sleep -Seconds 2
-                $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
-                foreach ($p in ($parts | Where-Object DriveLetter)) {
-                    $lp = "$($p.DriveLetter):\gen2convert-pe.log"
-                    if (Test-Path $lp) { $peLog = Get-Content $lp -Raw; break }
-                }
-                if ($peLog) {
-                    $out.Add('--- PE convert log ---')
-                    ($peLog -split "`r?`n") | Where-Object { $_ } | ForEach-Object { $out.Add($_) }
-                }
-                if ($style -ne 'GPT') { $fail = "PE run finished but the copy is still $style (see PE log above). Original VM intact." }
-                else { $ok = $true; $out.Add('Copy verified GPT - conversion succeeded.') }
+                if (-not $done) { throw 'PE staging did not power off within 25 min - check its console, then remove it.' }
+                $out.Add("PE staging finished and powered off after ~$(($j + 1) * 10)s.")
             }
-            catch { $fail = "post-check: $_" }
-            finally { if ($mounted) { Dismount-VHD -Path $bootDisk -ErrorAction SilentlyContinue } }
-        }
-        [pscustomobject]@{ Ok = $ok; Fail = $fail; Lines = $out }
-    } -ArgumentList $StagingName, $bootCopy, $newDir, $PeIsoPath
-    $convResult.Lines | ForEach-Object { Log $_ }
-    if (-not $convResult.Ok) { throw "convert phase: $($convResult.Fail)" }
+            catch { $fail = "$_" }
+            finally {
+                $st = Get-VM -Name $sName -ErrorAction SilentlyContinue
+                if ($st) {
+                    if ($st.State -ne 'Off') { Stop-VM -Name $sName -TurnOff -Force -ErrorAction SilentlyContinue }
+                    Remove-VM -Name $sName -Force -ErrorAction SilentlyContinue
+                    if (Get-VM -Name $sName -ErrorAction SilentlyContinue) { $out.Add("STAGING CLEANUP INCOMPLETE: remove '$sName' manually.") }
+                    else { $out.Add('Staging shell removed (verified).') }
+                }
+            }
+            if (-not $fail) {
+                # Verify the copy is now GPT; pull the PE log off the disk for the report
+                $mounted = $false
+                try {
+                    $disk = Mount-VHD -Path $bootDisk -ReadOnly -Passthru | Get-Disk
+                    $mounted = $true
+                    $style = $disk.PartitionStyle
+                    $peLog = $null
+                    $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
+                    foreach ($p in ($parts | Where-Object { -not $_.DriveLetter -and $_.Type -match 'IFS|Basic' })) {
+                        try { $p | Add-PartitionAccessPath -AssignDriveLetter | Out-Null } catch {}
+                    }
+                    Start-Sleep -Seconds 2
+                    $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
+                    foreach ($p in ($parts | Where-Object DriveLetter)) {
+                        $lp = "$($p.DriveLetter):\gen2convert-pe.log"
+                        if (Test-Path $lp) { $peLog = Get-Content $lp -Raw; break }
+                    }
+                    if ($peLog) {
+                        $out.Add('--- PE convert log ---')
+                        ($peLog -split "`r?`n") | Where-Object { $_ } | ForEach-Object { $out.Add($_) }
+                    }
+                    if ($style -ne 'GPT') { $fail = "PE run finished but the copy is still $style (see PE log above). Original VM intact." }
+                    else { $ok = $true; $out.Add('Copy verified GPT - conversion succeeded.') }
+                }
+                catch { $fail = "post-check: $_" }
+                finally { if ($mounted) { Dismount-VHD -Path $bootDisk -ErrorAction SilentlyContinue } }
+            }
+            [pscustomobject]@{ Ok = $ok; Fail = $fail; Lines = $out }
+        } -ArgumentList $StagingName, $bootCopy, $newDir, $PeIsoPath
+        $convResult.Lines | ForEach-Object { Log $_ }
+        if (-not $convResult.Ok) { throw "convert phase: $($convResult.Fail)" }
+    }
+
 
     # (Old staging-VM path removed: PowerShell Direct into an isolated clone
     # cannot authenticate domain accounts - no DC reachable, and cached
@@ -394,7 +462,14 @@ try {
     # PHASE 4 - BUILD THE GEN2 VM
     # =========================================================================
     $phase = 'build'
-    Log "Building Gen2 VM '$NewName' THROUGH VMM (fully VMM-managed, HA carried)..."
+    if ($InPlace) {
+        $buildBoot   = $boot[0].Path
+        $buildOthers = @($diskInfo | Where-Object { -not $_.IsBoot } | ForEach-Object { $_.Path })
+    } else {
+        $buildBoot   = $bootCopy
+        $buildOthers = @($copyPlan | Where-Object { -not $_.IsBoot } | ForEach-Object { $_.Dst })
+    }
+    Log "Building Gen2 VM '$NewName' THROUGH VMM (fully VMM-managed, HA carried)$(if ($InPlace) { ' on the ORIGINAL disks' })..."
     $jobGroup = [guid]::NewGuid().Guid
     $hwName   = "tmp-$NewName-$([guid]::NewGuid().ToString('N').Substring(0,8))"
     $hwProfile = $null
@@ -415,13 +490,13 @@ try {
 
         # Disks: boot disk at SCSI 0:0 (marked boot/system), data disks after it
         $lun = 0
-        foreach ($p in @($copyPlan | Where-Object IsBoot) + @($copyPlan | Where-Object { -not $_.IsBoot })) {
+        foreach ($p in @($buildBoot) + $buildOthers) {
             $dArgs = @{
                 SCSI = $true; Bus = 0; LUN = $lun; JobGroup = $jobGroup
                 UseLocalVirtualHardDisk = $true
-                Path = (Split-Path $p.Dst); FileName = (Split-Path $p.Dst -Leaf)
+                Path = (Split-Path $p); FileName = (Split-Path $p -Leaf)
             }
-            if ($p.IsBoot) { $dArgs['BootVolume'] = $true; $dArgs['SystemVolume'] = $true }
+            if ($p -eq $buildBoot) { $dArgs['BootVolume'] = $true; $dArgs['SystemVolume'] = $true }
             New-SCVirtualDiskDrive @dArgs | Out-Null
             $lun++
         }
