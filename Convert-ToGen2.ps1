@@ -318,7 +318,7 @@ try {
     # disk number, dismount. The original VM's disks are never mounted.
     # =========================================================================
     $phase = 'convert'
-    Log "rev host-mount-c | Mounting boot-disk copy on $hvHost and converting with mbr2gpt (no staging VM needed)..."
+    Log "rev host-mount-d | Mounting boot-disk copy on $hvHost and converting with mbr2gpt (no staging VM needed)..."
     $convResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
         param($bootDisk)
         $ErrorActionPreference = 'Stop'
@@ -337,6 +337,14 @@ try {
             if ($disk.IsReadOnly) { Set-Disk -Number $disk.Number -IsReadOnly $false }
             Start-Sleep -Seconds 5
             $disk = Get-Disk -Number $disk.Number
+            $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
+            # Volumes often arrive with NO drive letters when a foreign disk is
+            # onlined - mbr2gpt then sees no accessible volumes and reports
+            # "Cannot find OS partition(s)". Give NTFS partitions letters.
+            foreach ($p in ($parts | Where-Object { $_.Type -match 'IFS|Basic' -and -not $_.DriveLetter })) {
+                try { $p | Add-PartitionAccessPath -AssignDriveLetter } catch {}
+            }
+            Start-Sleep -Seconds 3
             $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
             $out.Add("Mounted as host disk #$($disk.Number) ($([math]::Round($disk.Size/1GB,1))GB, $($disk.PartitionStyle), offline=$($disk.IsOffline), readonly=$($disk.IsReadOnly)). Partitions: $(($parts | ForEach-Object { "#$($_.PartitionNumber) $($_.Type) $([math]::Round($_.Size/1GB,1))GB$(if ($_.IsActive) {' ACTIVE'})$(if ($_.DriveLetter) {" ($($_.DriveLetter):)"})" }) -join ' | ')")
             if ($disk.PartitionStyle -eq 'GPT') { throw 'Copy is already GPT - unexpected; inspect manually.' }
