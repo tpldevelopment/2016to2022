@@ -194,7 +194,13 @@ try {
         param($p)
         $ErrorActionPreference = 'Stop'
         if (Test-Path $p) { throw "Target folder already exists: $p" }
-        [math]::Round((Get-PSDrive $p.Substring(0,1)).Free / 1GB, 1)
+        # Mount-point-aware: CSVs live under C:\ClusterStorage\ - a drive-letter
+        # check would measure the host OS volume instead of the CSV.
+        $probe = $p
+        while (-not (Test-Path $probe)) { $probe = Split-Path $probe }   # nearest existing ancestor
+        $vol = Get-Volume -FilePath $probe -ErrorAction SilentlyContinue
+        if ($vol) { [math]::Round($vol.SizeRemaining / 1GB, 1) }
+        else      { [math]::Round((Get-PSDrive $p.Substring(0,1)).Free / 1GB, 1) }   # non-CSV fallback
     } -ArgumentList $newDir
     Log "Target: $newDir | need ~${needGB}GB (incl. VHD conversion temp), volume has ${freeGB}GB free"
     if ($freeGB -lt $needGB) { throw "Not enough space (need ~${needGB}GB, have ${freeGB}GB)." }
