@@ -335,7 +335,32 @@ try {
     # =========================================================================
     if ($InPlace) {
         $phase = 'convert-inplace'
-        Log "rev inplace-a | Converting the ORIGINAL system disk inside the running guest (backup attested; MBR fallback copy kept in $newDir)..."
+        # The shared shutdown+copy phases just ran (clean MBR fallback copy in
+        # $newDir). Conversion needs the guest RUNNING again - start it back up.
+        Log "rev inplace-b | Starting '$VMName' back up to convert inside the running guest..."
+        Start-SCVirtualMachine -VM (Get-SCVirtualMachine -Name $VMName) -ErrorAction Stop | Out-Null
+        $ready = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+            param($name, $cred)
+            $ErrorActionPreference = 'Stop'
+            $up = $false
+            for ($j = 0; $j -lt 60; $j++) {
+                Start-Sleep -Seconds 10
+                if ("$((Get-VM -Name $name).Heartbeat)" -like 'Ok*') { $up = $true; break }
+            }
+            if (-not $up) { return 'no-heartbeat' }
+            for ($j = 0; $j -lt 12; $j++) {
+                try {
+                    Invoke-Command -VMName $name -Credential $cred -ScriptBlock { 'ready' } -ErrorAction Stop | Out-Null
+                    return 'ready'
+                } catch {
+                    if ($_.Exception.Message -match 'credential|password|logon failure|authentication|access is denied') { return "auth: $($_.Exception.Message)" }
+                    Start-Sleep -Seconds 15
+                }
+            }
+            'no-psdirect'
+        } -ArgumentList $VMName, $guestCred
+        if ($ready -ne 'ready') { throw "Guest did not become reachable after restart ($ready). VM is running and unconverted - shut it down or retry." }
+        Log "Guest back up + PowerShell Direct ready - converting (MBR fallback copy kept in $newDir)..."
         $ipResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
             param($name, $cred)
             $ErrorActionPreference = 'Stop'
