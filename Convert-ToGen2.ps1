@@ -311,37 +311,52 @@ try {
     # disk number, dismount. The original VM's disks are never mounted.
     # =========================================================================
     $phase = 'convert'
-    Log "Mounting boot-disk copy on $hvHost and converting with mbr2gpt (no staging VM needed)..."
+    Log "rev host-mount-c | Mounting boot-disk copy on $hvHost and converting with mbr2gpt (no staging VM needed)..."
     $convResult = Invoke-Command -ComputerName $hvHost -ScriptBlock {
         param($bootDisk)
         $ErrorActionPreference = 'Stop'
         $out = New-Object System.Collections.Generic.List[string]
+        $ok = $false; $failMsg = $null
         $mounted = $false
+        function Get-SetupLogTail {
+            try {
+                (Select-String -Path "$env:windir\setupact.log" -Pattern 'MBR2GPT' | Select-Object -Last 12 | ForEach-Object { $_.Line.Trim() })
+            } catch { @("(could not read $env:windir\setupact.log: $_)") }
+        }
         try {
             $disk = Mount-VHD -Path $bootDisk -Passthru | Get-Disk
             $mounted = $true
-            # Host SAN policy typically brings newly-mounted disks up OFFLINE -
-            # mbr2gpt then cannot see the volumes ("Cannot find OS partition(s)")
             if ($disk.IsOffline)  { Set-Disk -Number $disk.Number -IsOffline $false }
             if ($disk.IsReadOnly) { Set-Disk -Number $disk.Number -IsReadOnly $false }
-            Start-Sleep -Seconds 5      # let volumes arrive
+            Start-Sleep -Seconds 5
             $disk = Get-Disk -Number $disk.Number
             $parts = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue
-            $out.Add("Mounted $bootDisk as host disk #$($disk.Number) ($([math]::Round($disk.Size/1GB,1))GB, $($disk.PartitionStyle), offline=$($disk.IsOffline)). Partitions: $(($parts | ForEach-Object { "$($_.PartitionNumber):$($_.Type)/$([math]::Round($_.Size/1GB,1))GB" }) -join ', ')")
-            if ($disk.PartitionStyle -eq 'GPT') { throw "Copy is already GPT - unexpected; inspect manually." }
+            $out.Add("Mounted as host disk #$($disk.Number) ($([math]::Round($disk.Size/1GB,1))GB, $($disk.PartitionStyle), offline=$($disk.IsOffline), readonly=$($disk.IsReadOnly)). Partitions: $(($parts | ForEach-Object { "#$($_.PartitionNumber) $($_.Type) $([math]::Round($_.Size/1GB,1))GB$(if ($_.IsActive) {' ACTIVE'})$(if ($_.DriveLetter) {" ($($_.DriveLetter):)"})" }) -join ' | ')")
+            if ($disk.PartitionStyle -eq 'GPT') { throw 'Copy is already GPT - unexpected; inspect manually.' }
 
-            $v = & "$env:windir\System32\mbr2gpt.exe" /validate /disk:$($disk.Number) /allowFullOS 2>&1
-            $out.Add("validate: $($v -join ' | ')")
-            if ($LASTEXITCODE -ne 0) { throw "mbr2gpt VALIDATE failed (exit $LASTEXITCODE) on the mounted copy. Copy unchanged; original VM intact. See %windir%\setupact.log on the HOST." }
+            # Native mbr2gpt via cmd /c so stderr NEVER throws mid-run; exit
+            # code checked explicitly, full output captured either way.
+            $v = cmd.exe /c "$env:windir\System32\mbr2gpt.exe /validate /disk:$($disk.Number) /allowFullOS 2>&1"
+            $vExit = $LASTEXITCODE
+            $out.Add("validate (exit $vExit): $(($v | Where-Object { $_ }) -join ' | ')")
+            if ($vExit -ne 0) {
+                $out.Add('--- setupact.log (MBR2GPT tail) ---')
+                Get-SetupLogTail | ForEach-Object { $out.Add($_) }
+                throw "mbr2gpt VALIDATE failed (exit $vExit) on the mounted copy. Copy unchanged; original VM intact."
+            }
 
-            $c = & "$env:windir\System32\mbr2gpt.exe" /convert /disk:$($disk.Number) /allowFullOS 2>&1
-            $out.Add("convert: $($c -join ' | ')")
-            if ($LASTEXITCODE -eq 100) { throw 'mbr2gpt exit 100: copy converted to GPT but BCD restore FAILED - converted-but-unbootable. Delete the copies and rerun. Original VM intact.' }
-            if ($LASTEXITCODE -ne 0) { throw "mbr2gpt CONVERT failed (exit $LASTEXITCODE) on the mounted copy. See %windir%\setupact.log / setuperr.log on the HOST. Original VM intact." }
+            $c = cmd.exe /c "$env:windir\System32\mbr2gpt.exe /convert /disk:$($disk.Number) /allowFullOS 2>&1"
+            $cExit = $LASTEXITCODE
+            $out.Add("convert (exit $cExit): $(($c | Where-Object { $_ }) -join ' | ')")
+            if ($cExit -eq 100) { throw 'mbr2gpt exit 100: copy converted to GPT but BCD restore FAILED - converted-but-unbootable. Delete the copies and rerun. Original VM intact.' }
+            if ($cExit -ne 0) {
+                $out.Add('--- setupact.log (MBR2GPT tail) ---')
+                Get-SetupLogTail | ForEach-Object { $out.Add($_) }
+                throw "mbr2gpt CONVERT failed (exit $cExit) on the mounted copy. Original VM intact."
+            }
 
             Dismount-VHD -Path $bootDisk
             $mounted = $false
-            # Post-check: confirm the copy is now GPT
             $check = Mount-VHD -Path $bootDisk -ReadOnly -Passthru | Get-Disk
             $mounted = $true
             $style = $check.PartitionStyle
@@ -349,13 +364,16 @@ try {
             $mounted = $false
             if ($style -ne 'GPT') { throw "Post-convert check: mounted copy reports '$style', expected GPT." }
             $out.Add('Conversion complete and verified GPT (firmware switch happens via the Gen2 VM).')
+            $ok = $true
         }
+        catch { $failMsg = "$_" }
         finally {
             if ($mounted) { Dismount-VHD -Path $bootDisk -ErrorAction SilentlyContinue }
         }
-        $out
+        [pscustomobject]@{ Ok = $ok; Fail = $failMsg; Lines = $out }
     } -ArgumentList $bootCopy
-    $convResult | ForEach-Object { Log $_ }
+    $convResult.Lines | ForEach-Object { Log $_ }
+    if (-not $convResult.Ok) { throw "convert phase: $($convResult.Fail)" }
 
     # (Old staging-VM path removed: PowerShell Direct into an isolated clone
     # cannot authenticate domain accounts - no DC reachable, and cached
