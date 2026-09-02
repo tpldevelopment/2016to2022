@@ -4,5 +4,6 @@
   "SmtpPort": 25,
   "MailFrom": "hyperv-automation@yourdomain.local",
   "MailTo": ["you@yourdomain.local"],
-  "StartAfter": true
+  "StartAfter": true,
+  "PeIsoPath": "C:\\ClusterStorage\\<volume>\\gen2convert.iso"
 }
