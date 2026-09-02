@@ -69,6 +69,9 @@ try {
         Log "'$VMName' is powered off."
     }
     if (Get-SCVirtualMachine -Name $NewName) { throw "'$NewName' already exists - clean up first." }
+    if ($vm.VMCheckpoints.Count -gt 0) {
+        throw "'$VMName' has $($vm.VMCheckpoints.Count) checkpoint(s). The disk copy would grab the PRE-checkpoint state. Verify the mbr2gpt conversion took, DELETE the checkpoint (lets the disk chain merge), wait for the merge to finish, then rerun."
+    }
 
     $hvHost = $vm.VMHost.Name
     Log "VM found on host: $hvHost | vCPU $($vm.CPUCount) | RAM $($vm.Memory)MB | Gen $($vm.Generation)"
