@@ -101,3 +101,19 @@ Microsoft's 2019/2022/2025 VMM docs. Result: parameter sets valid, plus:
 4. Not validated by any reviewer: actual runtime behavior on Hyper-V/SCVMM
    (no Windows environment available to either reviewer) — the pilot IS the
    runtime test. Codex also noted there are no Pester tests.
+
+## In-place mode review (2026-09-02, pre-pilot) — was NO-GO, all findings fixed
+
+Codex reviewed e7c4f32..30ff8dd (host-mount + PE staging + new -InPlace mode)
+before the live -InPlace run. Verdict: NO-GO with 2 P0 + 5 P1. All fixed in a13eded:
+
+| Sev | Finding | Fix |
+|---|---|---|
+| P0 | Failure/success text could tell the operator to boot a GPT disk as Gen1 or delete the only MBR fallback | State-aware messaging (conversionAttempted/disksDetached/newVmCreated); in-place recovery prints exact rebuild commands using the -temp MBR copies at original controller positions |
+| P0 | Gap between "converted" and "shut down": lost remoting result = GPT disk on a running Gen1 | Guest schedules its own shutdown (5s) after exit 0; host force-TurnOffs on a 10-min deadline |
+| P1 | Detach bypassed VMM (stale ownership risk), non-atomic | Remove-SCVirtualDiskDrive -SkipDeleteVHD per disk + Read-SCVirtualMachine -Force + both-sides zero-attachment and file-existence verification |
+| P1 | Cluster owner captured once, reused after power cycles | Owner re-resolved after each transition and before detach/force-off |
+| P1 | BitLocker not truly fail-closed; default RebootCount resumes protection on first Gen2 boot | -RebootCount 0, manage-bde disable fallback, protectors resumed on validate failure |
+| P1 | PE mode could bless exit-100 (converted-but-unbootable) because "disk is GPT" | Success now requires GPT + explicit OK marker written only on exit 0 |
+| P1 | 64-disk gate checked an unset variable | Moved after $diskInfo assignment |
+| nice | ISO builder ignored native exit codes; PE log search C-G only; Verify disk-count false-fails on diskless shell; docs promised copy-mode rollback for all modes | All addressed |
