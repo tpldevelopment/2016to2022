@@ -227,8 +227,13 @@ try {
                     if ($LASTEXITCODE -ne 0) { throw "Cannot determine BitLocker state (manage-bde exit $LASTEXITCODE) - refusing to assume 'off'." }
                     $vols = @()
                     if ($raw -match 'Protection Status:\s*Protection On') { $vols = @('(volume detected via manage-bde)') }
+                } elseif ((Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) -and
+                          -not (Get-WindowsFeature -Name BitLocker).Installed) {
+                    # No tooling because the BitLocker FEATURE is not installed -
+                    # on Windows Server that means BitLocker cannot be active.
+                    $vols = @()
                 } else {
-                    throw 'Cannot determine BitLocker state (no Get-BitLockerVolume, no manage-bde) - refusing to assume off.'
+                    throw 'Cannot determine BitLocker state (no Get-BitLockerVolume, no manage-bde, feature state unknown) - refusing to assume off.'
                 }
                 [pscustomobject]@{ BitLockerOn = $vols; OS = (Get-CimInstance Win32_OperatingSystem).Caption }
             }
@@ -357,6 +362,9 @@ try {
                     $raw = & "$env:windir\System32\manage-bde.exe" -status 2>&1 | Out-String
                     if ($LASTEXITCODE -ne 0) { throw 'Cannot determine BitLocker state in staging - refusing to convert blind.' }
                     if ($raw -match 'Protection Status:\s*Protection On') { throw 'BitLocker ON but Get-BitLockerVolume unavailable to suspend it - handle manually.' }
+                } elseif ((Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) -and
+                          -not (Get-WindowsFeature -Name BitLocker).Installed) {
+                    $r.Add('BitLocker feature not installed - cannot be active; proceeding.')
                 } else {
                     throw 'Cannot determine BitLocker state in staging (no tooling) - refusing to convert blind.'
                 }
