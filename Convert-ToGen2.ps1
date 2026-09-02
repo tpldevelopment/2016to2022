@@ -56,7 +56,17 @@ try {
     if (-not $vm) { throw "VM '$VMName' not found in VMM." }
     if ($vm.Generation -eq 2) { throw "'$VMName' is already Generation 2." }
     if ($vm.VirtualMachineState -ne 'PowerOff') {
-        throw "'$VMName' is $($vm.VirtualMachineState) - power it off first (and make sure mbr2gpt /convert was run)."
+        Log "'$VMName' is $($vm.VirtualMachineState) - shutting it down (make sure mbr2gpt /convert was already run!)..."
+        Stop-SCVirtualMachine -VM $vm -Shutdown -ErrorAction Stop | Out-Null
+        for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 10
+            $vm = Get-SCVirtualMachine -Name $VMName
+            if ($vm.VirtualMachineState -eq 'PowerOff') { break }
+        }
+        if ($vm.VirtualMachineState -ne 'PowerOff') {
+            throw "'$VMName' did not shut down within 10 minutes - aborting."
+        }
+        Log "'$VMName' is powered off."
     }
     if (Get-SCVirtualMachine -Name $NewName) { throw "'$NewName' already exists - clean up first." }
 
