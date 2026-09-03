@@ -121,12 +121,13 @@ try {
     $nicSpec = @($vm.VirtualNetworkAdapters | ForEach-Object {
         @{ Switch = "$($_.VirtualNetwork)"; VlanEnabled = $_.VLanEnabled; Vlan = $_.VLanID
            Mac = $_.MACAddress; MacStatic = ($_.MACAddressType -eq 'Static')
-           VMNetwork = "$($_.VMNetwork)"; PortClass = "$($_.PortClassification)" } })
+           VMNetwork = "$($_.VMNetwork)"; PortClass = "$($_.PortClassification)"
+           VMSubnet = "$($_.VMSubnet)" } })
     foreach ($n in $nicSpec) {
         if ([string]::IsNullOrWhiteSpace($n.Switch) -and [string]::IsNullOrWhiteSpace($n.VMNetwork)) {
             throw "A NIC on '$VMName' has neither a VirtualNetwork nor a VMNetwork - cannot rebuild it."
         }
-        Log "NIC: $(if ($n.VMNetwork) { "VM network '$($n.VMNetwork)'" } else { "vSwitch '$($n.Switch)'" }) VLAN $(if ($n.VlanEnabled) { $n.Vlan } else { 'none' }) MAC $($n.Mac) ($(if ($n.MacStatic) {'static, carried over'} else {'dynamic - guest may re-detect NIC'}))$(if ($n.PortClass) { " port-class '$($n.PortClass)'" })"
+        Log "NIC: $(if ($n.VMNetwork) { "VM network '$($n.VMNetwork)'" } else { "vSwitch '$($n.Switch)'" })$(if ($n.VMSubnet) { " subnet '$($n.VMSubnet)'" }) VLAN $(if ($n.VlanEnabled) { $n.Vlan } else { 'none' }) MAC $($n.Mac) ($(if ($n.MacStatic) {'static, carried over'} else {'dynamic - guest may re-detect NIC'}))$(if ($n.PortClass) { " port-class '$($n.PortClass)'" })"
     }
 
     # Host-side preflight: disks (controller positions, format, chains),
@@ -167,6 +168,12 @@ try {
         if ($n.VMNetwork) {
             $c = @(Get-SCVMNetwork -Name $n.VMNetwork).Count
             if ($c -ne 1) { throw "VM network '$($n.VMNetwork)' resolves to $c objects in VMM - need exactly 1." }
+        }
+        if ($n.VMSubnet) {
+            if (-not $n.VMNetwork) { throw "NIC has VM subnet '$($n.VMSubnet)' but no VM network - cannot resolve it." }
+            $vmnetObj = Get-SCVMNetwork -Name $n.VMNetwork | Select-Object -First 1
+            $c = @(Get-SCVMSubnet -Name $n.VMSubnet -VMNetwork $vmnetObj).Count
+            if ($c -ne 1) { throw "VM subnet '$($n.VMSubnet)' resolves to $c objects in VM network '$($n.VMNetwork)' - need exactly 1." }
         }
         if ($n.PortClass) {
             $c = @(Get-SCPortClassification -Name $n.PortClass).Count
@@ -236,6 +243,7 @@ try {
     # Guest probe (creds + mbr2gpt + BitLocker) - FAIL-CLOSED BitLocker: if
     # state cannot be determined, that is an ABORT, never 'off'.
     $blOn = @()
+    $staticIpCfg = @()
     $guestProbed = $false
     if ($vm.VirtualMachineState -eq 'Running') {
         $probe = Invoke-Command -ComputerName $hvHost -ScriptBlock {
@@ -263,14 +271,36 @@ try {
                 } else {
                     throw 'Cannot determine BitLocker state (no Get-BitLockerVolume, no manage-bde, feature state unknown) - refusing to assume off.'
                 }
-                [pscustomobject]@{ BitLockerOn = $vols; OS = (Get-CimInstance Win32_OperatingSystem).Caption }
+                # Static IPv4 config, keyed by MAC - a new VM means new NIC
+                # hardware in Windows, so static IPs don't carry on their own.
+                # DHCP NICs are skipped: they re-lease fine on new hardware.
+                $staticNics = @(Get-NetIPConfiguration | ForEach-Object {
+                    $ipv4 = @($_.IPv4Address | Where-Object { $_ })
+                    if (-not $ipv4) { return }
+                    $dhcp = (Get-NetIPInterface -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).Dhcp
+                    if ($dhcp -eq 'Enabled') { return }
+                    $mac = (Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue).MacAddress
+                    if (-not $mac) { return }
+                    [pscustomobject]@{
+                        Mac          = $mac
+                        IPAddress    = $ipv4[0].IPAddress
+                        PrefixLength = $ipv4[0].PrefixLength
+                        Gateway      = ($_.IPv4DefaultGateway | Select-Object -First 1 -ExpandProperty NextHop)
+                        DNSServers   = @($_.DNSServer | Where-Object AddressFamily -eq 2 | Select-Object -ExpandProperty ServerAddresses)
+                    }
+                })
+                [pscustomobject]@{ BitLockerOn = $vols; OS = (Get-CimInstance Win32_OperatingSystem).Caption; StaticNics = $staticNics }
             }
         } -ArgumentList $VMName, $guestCred
         $blOn = @($probe.BitLockerOn)
+        $staticIpCfg = @($probe.StaticNics)
         $guestProbed = $true
-        Log "Guest probe OK: $($probe.OS) | mbr2gpt present | BitLocker $(if ($blOn.Count) { "ON: $($blOn -join ', ')" } else { 'off on all volumes' })"
+        Log "Guest probe OK: $($probe.OS) | mbr2gpt present | BitLocker $(if ($blOn.Count) { "ON: $($blOn -join ', ')" } else { 'off on all volumes' }) | static IPv4 on $($staticIpCfg.Count) NIC(s)"
         if ($blOn.Count) {
             Log "BITLOCKER GATE: verify recovery keys are escrowed (AD/backup) BEFORE proceeding. Protectors must be re-validated in the Gen2 VM - Verify-Gen2 checks this."
+        }
+        if ($staticIpCfg.Count) {
+            Log "STATIC IP: captured $(($staticIpCfg | ForEach-Object { "$($_.IPAddress)/$($_.PrefixLength) (MAC $($_.Mac))" }) -join '; ') - will attempt to reapply to '$NewName' by MAC match after it starts. Only reliable for NICs whose MAC is static (carried over); dynamic-MAC NICs won't match and need manual re-entry."
         }
     }
 
@@ -599,7 +629,11 @@ try {
         # default); VM-network binding preferred; VLAN/MAC/port class carried
         foreach ($n in $nicSpec) {
             $nicArgs = @{ JobGroup = $jobGroup; Synthetic = $true }
-            if ($n.VMNetwork) { $nicArgs['VMNetwork'] = Get-SCVMNetwork -Name $n.VMNetwork | Select-Object -First 1 }
+            if ($n.VMNetwork) {
+                $vmnetObj = Get-SCVMNetwork -Name $n.VMNetwork | Select-Object -First 1
+                $nicArgs['VMNetwork'] = $vmnetObj
+                if ($n.VMSubnet) { $nicArgs['VMSubnet'] = Get-SCVMSubnet -Name $n.VMSubnet -VMNetwork $vmnetObj | Select-Object -First 1 }
+            }
             elseif ($n.Switch) { $nicArgs['VirtualNetwork'] = $n.Switch }
             if ($n.VlanEnabled) { $nicArgs['VLanEnabled'] = $true; $nicArgs['VLanID'] = $n.Vlan }
             if ($n.MacStatic -and $n.Mac) { $nicArgs['MACAddress'] = $n.Mac; $nicArgs['MACAddressType'] = 'Static' }
@@ -637,6 +671,47 @@ try {
     if ($StartAfter) {
         Start-SCVirtualMachine -VM $inVmm[0] -ErrorAction Stop | Out-Null
         Log "'$NewName' started via VMM."
+        if ($staticIpCfg.Count -gt 0) {
+            Log "Reapplying $($staticIpCfg.Count) captured static IPv4 config(s) to '$NewName' (matched by MAC; best-effort - does not fail the run)..."
+            $ipReapply = Invoke-Command -ComputerName $hvHost -ScriptBlock {
+                param($name, $cred, $configs)
+                $out = New-Object System.Collections.Generic.List[string]
+                $up = $false
+                for ($j = 0; $j -lt 60; $j++) { Start-Sleep -Seconds 10; if ("$((Get-VM -Name $name).Heartbeat)" -like 'Ok*') { $up = $true; break } }
+                if (-not $up) { $out.Add('Guest heartbeat never came up - static IP(s) NOT reapplied, configure manually via console.'); return $out }
+                $ready = $false
+                for ($j = 0; $j -lt 12; $j++) {
+                    try { Invoke-Command -VMName $name -Credential $cred -ScriptBlock { 'ready' } -ErrorAction Stop | Out-Null; $ready = $true; break }
+                    catch { Start-Sleep -Seconds 15 }
+                }
+                if (-not $ready) { $out.Add('PowerShell Direct never became ready - static IP(s) NOT reapplied, configure manually via console.'); return $out }
+                Invoke-Command -VMName $name -Credential $cred -ScriptBlock {
+                    param($configs)
+                    $r = New-Object System.Collections.Generic.List[string]
+                    foreach ($c in $configs) {
+                        $macNorm = ($c.Mac -replace '[^0-9A-Fa-f]', '').ToUpper()
+                        $adapter = Get-NetAdapter | Where-Object { ($_.MacAddress -replace '[^0-9A-Fa-f]', '').ToUpper() -eq $macNorm }
+                        if (-not $adapter) { $r.Add("No adapter with MAC $($c.Mac) found in guest - '$($c.IPAddress)/$($c.PrefixLength)' NOT reapplied, configure manually."); continue }
+                        try {
+                            $existingIp = @(Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+                            if ($existingIp | Where-Object IPAddress -eq $c.IPAddress) { $r.Add("$($adapter.Name): already has $($c.IPAddress) - no change."); continue }
+                            Get-NetIPInterface -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Set-NetIPInterface -Dhcp Disabled -ErrorAction SilentlyContinue
+                            $existingIp | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+                            Get-NetRoute -InterfaceIndex $adapter.InterfaceIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                            $p = @{ InterfaceIndex = $adapter.InterfaceIndex; IPAddress = $c.IPAddress; PrefixLength = $c.PrefixLength; ErrorAction = 'Stop' }
+                            if ($c.Gateway) { $p['DefaultGateway'] = $c.Gateway }
+                            New-NetIPAddress @p | Out-Null
+                            if ($c.DNSServers.Count) { Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $c.DNSServers -ErrorAction Stop }
+                            $r.Add("$($adapter.Name) (MAC $($c.Mac)): applied $($c.IPAddress)/$($c.PrefixLength)$(if ($c.Gateway) { ", gateway $($c.Gateway)" })$(if ($c.DNSServers.Count) { ", DNS $($c.DNSServers -join '/')" }).")
+                        } catch { $r.Add("$($adapter.Name) (MAC $($c.Mac)): FAILED to apply $($c.IPAddress) - $_. Configure manually.") }
+                    }
+                    $r
+                } -ArgumentList (,$configs)
+            } -ArgumentList $VMName, $guestCred, $staticIpCfg
+            $ipReapply | ForEach-Object { Log "  $_" }
+        }
+    } elseif ($staticIpCfg.Count -gt 0) {
+        Log "STATIC IP: $($staticIpCfg.Count) config(s) captured but NOT reapplied (StartAfter is off in config.json, so '$NewName' was not started). Configure manually: $(($staticIpCfg | ForEach-Object { "$($_.IPAddress)/$($_.PrefixLength) (MAC $($_.Mac))" }) -join '; ')"
     }
     Log "NOT carried over: VMM cloud/owner/custom properties, IP-pool assignments, checkpoint policy, CPU limits/weights, memory buffer/priority, automatic start/stop actions, NIC security/offload settings, original disk controller layout (all disks re-attach in order on SCSI 0). Carried: CPU/RAM/dynamic memory, VM networks or vSwitch, VLANs, static MACs, port classifications, HA flag."
     if ($blOn.Count) { Log "BitLocker was ON - Verify-Gen2 gates on protection resuming in the Gen2 VM; confirm recovery-key escrow." }

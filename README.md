@@ -94,8 +94,18 @@ disk not at IDE 0:0), NICs with no VMM network binding at all.
 
 **Fully SCVMM-native:** the new VM is created THROUGH VMM (hardware profile
 + JobGroup), so it is VMM-owned from birth. Carried: CPU/RAM/dynamic memory,
-VM networks (or vSwitch fallback), VLANs, static MACs, port classifications,
-and the HA flag (HA path untested - pilot on non-HA first).
+VM networks (or vSwitch fallback) + VM subnets, VLANs, static MACs, port
+classifications, and the HA flag (HA path untested - pilot on non-HA first).
+
+**Guest static IPs:** a new VM means new NIC hardware in Windows, so a
+guest's static IPv4 config does not carry over on its own. The script
+captures each static (non-DHCP) NIC's IP/prefix/gateway/DNS during preflight
+and, if `StartAfter` is enabled, reapplies it to the matching NIC in
+`<name>-temp` by MAC address after it boots. This is best-effort and never
+fails the run - it needs the NIC's MAC to be static (carried over) to find
+the right adapter; check the log for `STATIC IP` lines and configure by hand
+if it says a config wasn't reapplied. DHCP NICs are untouched (they re-lease
+fine on new hardware).
 
 **Not carried:** VMM cloud/owner/custom properties, IP-pool assignments,
 checkpoint policy, CPU limits/weights, memory buffer/priority, automatic
